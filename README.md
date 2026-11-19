@@ -123,8 +123,17 @@ Key design decisions:
     so only the PTX's explicit `fma`/`mad` are fused. A 1024×768 Mandelbrot (up to 256 chaotic iterations
     per pixel) matches a CPU reference that follows the PTX operation sequence, **0 of 786,432 pixels
     different**. `METALCUDA_FP_CONTRACT=fast` lets Metal contract like ptxas may.
-  * `f64` has no Metal equivalent. It is computed in fp32 but stored as genuine IEEE binary64, so memory
-    layouts stay compatible (a warning is printed).
+  * **IEEE binary64 in software.** Metal has no `double`. f64 values stay binary64 bit patterns in `ulong`
+    registers and every operation goes through a soft-float library in MSL (`src/softfloat64.metal`:
+    SoftFloat-style add/sub/mul/fma with an exact 106-bit product, bit-serial division and square root,
+    round-to-nearest-even, subnormals, signed zeros, NaN/inf). It is checked bit for bit against the CPU on
+    17 operations × 262,144 inputs, including NaN, infinities, subnormals and catastrophic cancellation. The
+    cost is real: about 4.6× slower than fp32 on a memory-bound kernel, and more on compute-bound ones.
+    `METALCUDA_F64=fast` computes f64 in fp32 instead (layout stays binary64).
+  * **64-bit atomics** (Metal has no 64-bit CAS): every 64-bit atomic, `double` `atomicAdd` included, is a
+    read-modify-write under a spinlock from a hashed lock table. One lane per SIMD-group is elected with a
+    ballot to take a lock, so no lane ever spins on a lock held by its own SIMD-group. That keeps it
+    deadlock-free, which the first, simpler retry loop was not.
 * **Caching.** Module key = SHA-256(translator version, fp policy, PTX). The MSL is kept for inspection and
   the compiled pipelines go into a Metal binary archive: module load ~400 ms cold → ~2–3 ms warm.
 
@@ -142,7 +151,8 @@ Key design decisions:
   registration, error handling.
 * **PTX:** integer/float/f16/f16x2/bf16 arithmetic, all comparison modes (ordered/unordered), `cvt`
   with rounding and saturation, `ld/st` in all state spaces incl. vectors and generic addressing,
-  `cvta`, atomics/reductions (add/min/max/inc/dec/exch/cas/and/or/xor, f32, emulated 64-bit add),
+  `cvta`, atomics/reductions (add/min/max/inc/dec/exch/cas/and/or/xor; 32-bit, f32, and all 64-bit ops incl. f64 add,
+  on device and shared memory), f64 arithmetic/conversions/comparisons (exact IEEE),
   `bar.sync`, `bar.red` (`__syncthreads_count/and/or`), `membar`/`fence`, `shfl.sync` (exact clamp/segment
   semantics), `vote`, `redux`, `activemask`, `prmt`, `lop3`, `shf`, `bfe`/`bfi`, `bfind`, `popc`, `clz`,
   `brev`, `dp4a`, `mul24`, `cp.async` (executed synchronously), `.local` stack frames, module `.global`/`.const`
@@ -158,7 +168,7 @@ Key design decisions:
 | Test | What it covers |
 |---|---|
 | `tests/test_cuda_basic.c` | Phase-4 Driver API walk-through with nvcc-format PTX (vectorAdd, 1 M elements) |
-| `tests/test_driver_suite.c` | 25 tests × 3 builds of the same kernels (clang `-O3`, `-O1`, `-O0`): integer/bit/float semantics, conversions, structs by value, f64, 3-D grids, shared-memory reduction, warp shuffles/votes, histogram (shared + global atomics), scan, tiled SGEMM, atomics (CAS loops, inc wrap, 64-bit), local memory, `bar.red`, globals/constants, managed/pinned/registered memory, VMM, events, error paths, `cuGetProcAddress`, 10 k dependent launches, divergent-loop + barrier, an irreducible CFG |
+| `tests/test_driver_suite.c` | 31 tests × 3 builds of the same kernels (clang `-O3`, `-O1`, `-O0`): integer/bit/float semantics, conversions, structs by value, f64, 3-D grids, shared-memory reduction, warp shuffles/votes, histogram (shared + global atomics), scan, tiled SGEMM, atomics (CAS loops, inc wrap, 64-bit), local memory, `bar.red`, globals/constants, managed/pinned/registered memory, VMM, events, error paths, `cuGetProcAddress`, 10 k dependent launches, divergent-loop + barrier, an irreducible CFG, async-copy ordering and host-buffer reuse, reported capabilities; 64-bit atomics (returned old values must be an exact permutation, exchange must conserve every value, CAS loops, min/max, shared memory, `double` `atomicAdd`); IEEE binary64 bit-exactness |
 | `tests/test_runtime_app.cu` | an ordinary CUDA C++ app, built with both launch ABIs: bit-exact Mandelbrot, template kernels on a stream, softmax with dynamic shared memory, `cudaMemcpyToSymbol`/`FromSymbol`, managed memory, error idioms |
 | `tests/test_python.py` | a Linux-style `ctypes.CDLL("libcuda.so.1")` script fails on plain macOS and passes under `python -m metalcuda`; `metalcuda.enable()`; NumPy-checked vecadd, SAXPY, SGEMM, reduction, histogram, integer ops |
 
@@ -177,6 +187,7 @@ operation sequence is deterministic, tight tolerances for approximate math intri
 | shared-memory tree reduction, 16 M floats | 130–217 GB/s | 175–262 GB/s (same algorithm hand-written in MSL) |
 | naive 16×16-tiled SGEMM, 1024³ | 1.2–1.57 TFLOP/s | |
 | Mandelbrot 1024×768×256 | 15–30 G iterations/s | |
+| `f64_ops` (mul+fma+sqrt+sub), 4 M doubles | 1.55 G elements/s exact IEEE; 7.1 G with `METALCUDA_F64=fast` (fp32) | |
 
 Numbers vary between runs with GPU clock state. During one session the whole machine (native Metal
 included) was 10–50× slower per dispatch for a while, so measure on your own system before quoting.
@@ -196,13 +207,18 @@ included) was 10–50× slower per dispatch for a while, so measure on your own 
 * **Not translated:** tensor-core instructions (`mma`, `wmma`, `ldmatrix`), textures/surfaces, calls to
   non-inlined device functions (`call` other than `vprintf`, which is dropped), indirect branches,
   split barriers, cluster/TMA features, dynamic parallelism, grid-wide cooperative sync.
-* **Precision / hardware:** `f64` runs in fp32. 64-bit atomics: add is emulated (exact sum, the returned old
-  value may be torn), min/max only on device memory, no 64-bit CAS/exch. Threadgroup memory is 32 KiB
-  (CUDA kernels requesting more fail with `CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES`). Named barriers become full
-  barriers.
+* **f64 is exact but slow** (soft-float, see above). Rounding-mode modifiers other than round-to-nearest on
+  f64 arithmetic (`add.rz.f64`, …) are treated as round-to-nearest.
+* **64-bit atomics are correct but serialized per address.** Each attempt costs ~0.2 µs, so a 64-bit CAS retry
+  loop with many threads on one address degrades quadratically (one address, 4,096 threads: 1.7 s;
+  16,384 threads: 31 s). They are not atomic with respect to 32-bit atomics on the halves of the same word.
+* **Hardware:** threadgroup memory is 32 KiB (CUDA kernels requesting more fail with
+  `CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES`). Named barriers become full barriers.
 * **Scheduling:** all streams share one in-order Metal queue. This is a legal CUDA schedule, but kernels on
   different streams never overlap: two independent kernels on two streams take about as long as running
-  them back to back. Async memcpys complete synchronously. `cuMemFree` synchronises.
+  them back to back. The device therefore reports `concurrentKernels = 0`, `asyncEngineCount = 0` and
+  `deviceOverlap = 0`. Async memcpys complete synchronously and in stream order, so the host buffer can be
+  reused as soon as the call returns. `cuMemFree` synchronises.
 * **No isolation between kernels in a process.** Device pointers are raw GPU addresses and every allocation
   is resident, so a kernel can read or write any allocation in its process, not just the ones passed as
   arguments. Out-of-range accesses are not reported: in a quick probe, writes to unmapped addresses returned
@@ -222,6 +238,7 @@ included) was 10–50× slower per dispatch for a while, so measure on your own 
 | `METALCUDA_CACHE_DIR` | kernel cache location (default `~/.cache/metalcuda`, or `$XDG_CACHE_HOME/metalcuda`) |
 | `METALCUDA_SYNC=1` | synchronise after every launch (debugging) |
 | `METALCUDA_FP_CONTRACT=fast` | allow Metal to contract mul+add into FMA (default: off, bit-exact with the PTX) |
+| `METALCUDA_F64=fast` | compute f64 in fp32 (default: exact IEEE binary64 in software) |
 | `METALCUDA_NO_STRUCTURIZE=1` | force the block-dispatch loop (debugging the structurizer) |
 | `METALCUDA_DISABLE_REDIRECT=1` | keep the library injected but stop redirecting `dlopen` |
 | `METALCUDA_LIB` | Python: path to `libmetalcuda.dylib` |
@@ -233,10 +250,11 @@ with Metal), or look at `~/.cache/metalcuda/<hash>.metal`.
 
 ```
 include/        cuda.h, cuda_runtime.h, cuda_runtime_api.h, cudart.h, vector_types.h, metalcuda_device.h
-src/            ptx_to_metal.c (translator + structurizer), runtime.m (Driver API on Metal),
+src/            ptx_to_metal.c (translator + structurizer), softfloat64.metal (IEEE binary64 in MSL),
+                runtime.m (Driver API on Metal),
                 cudart.c (Runtime API + launch ABI), fatbin.c (fatbin/LZ4), interpose.c (dyld interposer)
 python/metalcuda/   enable(), `python -m metalcuda`, driver.py (NumPy-friendly Driver API wrapper)
-tools/          mc-ptx2msl, mkfatbin.py (fat binary packer with LZ4), metal_baseline.m
+tools/          mc-ptx2msl, mkfatbin.py (fat binary packer with LZ4), metal_baseline.m, embed_msl.py
 tests/          test_cuda_basic.c, test_driver_suite.c, test_runtime_app.cu, test_python.py, bench.c, kernels/*.cu
 ```
 

@@ -15,7 +15,7 @@ BIN      := $(BUILD)/bin
 PTXDIR   := $(BUILD)/ptx
 
 CC       := clang
-CFLAGS   := -O2 -g -Wall -Wextra -Wno-unused-parameter -fvisibility=hidden -Iinclude -Isrc
+CFLAGS   := -O2 -g -Wall -Wextra -Wno-unused-parameter -fvisibility=hidden -Iinclude -Isrc -I$(OBJ)
 OBJCFLAGS:= $(CFLAGS) -fobjc-arc
 FRAMEWORKS := -framework Metal -framework Foundation -framework QuartzCore -framework IOKit
 
@@ -47,6 +47,12 @@ all: lib tools
 
 lib: $(DYLIB) $(SHIMS)
 
+# the binary64 soft-float library is MSL source embedded into the translator
+$(OBJ)/softfloat64.inc: src/softfloat64.metal tools/embed_msl.py | $(OBJ)
+	python3 tools/embed_msl.py MC_SOFTFLOAT64_MSL $< > $@
+
+$(OBJ)/ptx_to_metal.o: $(OBJ)/softfloat64.inc
+
 $(OBJ)/%.o: src/%.c $(HEADERS) | $(OBJ)
 	$(CC) $(CFLAGS) -std=c11 -c $< -o $@
 
@@ -73,8 +79,8 @@ $(LIB)/libcudart.12.dylib: $(DYLIB)
 
 tools: $(BIN)/mc-ptx2msl
 
-$(BIN)/mc-ptx2msl: tools/ptx2msl.m src/ptx_to_metal.c src/ptx_to_metal.h | $(BIN)
-	$(CC) -O2 -fobjc-arc -Isrc tools/ptx2msl.m src/ptx_to_metal.c -framework Metal -framework Foundation -o $@
+$(BIN)/mc-ptx2msl: tools/ptx2msl.m src/ptx_to_metal.c src/ptx_to_metal.h $(OBJ)/softfloat64.inc | $(BIN)
+	$(CC) -O2 -fobjc-arc -Isrc -I$(OBJ) tools/ptx2msl.m src/ptx_to_metal.c -framework Metal -framework Foundation -o $@
 
 # ---------------------------------------------------------------- tests
 
@@ -99,7 +105,7 @@ $(BIN)/test_cuda_basic: tests/test_cuda_basic.c lib | $(BIN)
 
 # Driver API suite over clang-generated PTX
 $(BIN)/test_driver_suite: tests/test_driver_suite.c lib | $(BIN)
-	$(CC) -O2 -Iinclude $< -L$(LIB) -lcuda -Wl,-rpath,@loader_path/../lib -o $@
+	$(CC) -O2 -ffp-contract=off -Iinclude $< -L$(LIB) -lcuda -Wl,-rpath,@loader_path/../lib -o $@
 
 # A complete CUDA *runtime* application (<<<>>> launches, cudaMalloc, __constant__,
 # __device__ globals, events). Compiled exactly like clang's CUDA driver does it:

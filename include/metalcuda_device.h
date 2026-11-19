@@ -50,6 +50,13 @@ MC_DEV unsigned atomicExch(unsigned *p, unsigned v) { return (unsigned)__nvvm_at
 MC_DEV float atomicExch(float *p, float v) { return __builtin_bit_cast(float, __nvvm_atom_xchg_gen_i((int *)p, __builtin_bit_cast(int, v))); }
 MC_DEV int atomicCAS(int *p, int c, int v) { return __nvvm_atom_cas_gen_i(p, c, v); }
 MC_DEV unsigned atomicCAS(unsigned *p, unsigned c, unsigned v) { return (unsigned)__nvvm_atom_cas_gen_i((int *)p, (int)c, (int)v); }
+MC_DEV unsigned long long atomicCAS(unsigned long long *p, unsigned long long c, unsigned long long v) { return (unsigned long long)__nvvm_atom_cas_gen_ll((long long *)p, (long long)c, (long long)v); }
+MC_DEV unsigned long long atomicExch(unsigned long long *p, unsigned long long v) { return (unsigned long long)__nvvm_atom_xchg_gen_ll((long long *)p, (long long)v); }
+MC_DEV unsigned long long atomicMax(unsigned long long *p, unsigned long long v) { return __nvvm_atom_max_gen_ull(p, v); }
+MC_DEV unsigned long long atomicMin(unsigned long long *p, unsigned long long v) { return __nvvm_atom_min_gen_ull(p, v); }
+MC_DEV long long atomicMax(long long *p, long long v) { return __nvvm_atom_max_gen_ll(p, v); }
+MC_DEV unsigned long long atomicXor(unsigned long long *p, unsigned long long v) { return (unsigned long long)__nvvm_atom_xor_gen_ll((long long *)p, (long long)v); }
+MC_DEV double atomicAdd(double *p, double v) { return __nvvm_atom_add_gen_d(p, v); }
 MC_DEV unsigned atomicInc(unsigned *p, unsigned v) { return __nvvm_atom_inc_gen_ui(p, v); }
 MC_DEV unsigned atomicDec(unsigned *p, unsigned v) { return __nvvm_atom_dec_gen_ui(p, v); }
 MC_DEV int atomicAnd(int *p, int v) { return __nvvm_atom_and_gen_i(p, v); }
@@ -125,6 +132,14 @@ MC_DEV float __fmaf_rn(float a, float b, float c) { return __nvvm_fma_rn_f(a, b,
 MC_DEV int __float2int_rn(float x) { return __nvvm_f2i_rn(x); }
 MC_DEV int __float2int_rz(float x) { return __nvvm_f2i_rz(x); }
 MC_DEV double sqrt(double x) { return __builtin_sqrt(x); }
+MC_DEV double fmin(double a, double b) { return __builtin_fmin(a, b); }
+MC_DEV double fmax(double a, double b) { return __builtin_fmax(a, b); }
+MC_DEV double floor(double x) { return __builtin_floor(x); }
+MC_DEV double ceil(double x) { return __builtin_ceil(x); }
+MC_DEV double rint(double x) { return __builtin_rint(x); }
+MC_DEV long long __double_as_longlong(double x) { return __builtin_bit_cast(long long, x); }
+MC_DEV double __longlong_as_double(long long x) { return __builtin_bit_cast(double, x); }
+MC_DEV int __double2int_rn(double x) { return __nvvm_d2i_rn(x); }
 MC_DEV double fabs(double x) { return __builtin_fabs(x); }
 MC_DEV double fma(double a, double b, double c) { return __builtin_fma(a, b, c); }
 

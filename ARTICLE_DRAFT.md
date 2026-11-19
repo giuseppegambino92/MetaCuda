@@ -140,9 +140,18 @@ v_r8 = as_type<uint>((as_type<float>(v_r6) + as_type<float>(v_r7)));
 ```
 
 The Metal compiler erases all of it. The same rule covers f16 in 16-bit registers, `0f3F800000` float
-literals in integer moves, and 64-bit packs/unpacks. `f64` is the one real gap: Metal has no double. I
-compute in fp32 but keep binary64 in memory (converting on load/store), so data structures stay
-compatible and the precision loss is announced, not silent.
+literals in integer moves, and 64-bit packs/unpacks.
+
+`f64` is the hard case: Metal has no `double` at all. My first version computed in fp32 and kept binary64
+only in memory. That preserves data layouts but not results, and a reviewer rightly called it a real
+incompatibility. Now f64 values stay binary64 bit patterns in `ulong` registers, and every operation calls a
+soft-float library written in MSL. Add, subtract, multiply and fused multiply-add follow Berkeley
+SoftFloat, with an exact 106-bit product for `fma`; division and square root are bit-serial integer
+algorithms. Everything rounds to nearest-even with subnormals, signed zeros and NaN/inf handled. A test
+runs 17 operations over 262,144 inputs chosen to hit NaNs, infinities, subnormals and catastrophic
+cancellation and compares every result bit for bit with the CPU: zero differences. It costs speed (about
+4.6× fp32 on a memory-bound kernel, more on compute-bound ones), so `METALCUDA_F64=fast` keeps the fp32 path
+as an explicit opt-in.
 
 ### MSL has no `goto`
 
@@ -208,21 +217,29 @@ The long tail is what makes real compiler output run:
   `cvta.shared`) get a tag in the top 16 bits, and loads, stores and atomics check it at runtime.
 * `shfl.sync` is implemented with its exact clamp/segment-mask semantics on top of `simd_shuffle`. Apple
   SIMD-groups are 32 wide, like warps.
-* Float atomics in threadgroup memory don't exist in MSL, so they become CAS loops. 64-bit atomic add
-  becomes two 32-bit atomics with carry (exact sum).
+* Float atomics in threadgroup memory don't exist in MSL, so they become CAS loops.
+* **64-bit atomics have no hardware equivalent in Metal** (no 64-bit compare-and-swap). The first version
+  did a 64-bit add as two 32-bit atomics with carry: the sum was exact, but the returned old value could be
+  torn. Now every 64-bit atomic is a read-modify-write under a spinlock from a hashed lock table. My first
+  lock loop deadlocked under contention: if the compiler moves the critical section after the retry loop, a
+  lane holding a lock waits at reconvergence for lanes of its own SIMD-group that are spinning on that very
+  lock. The fix elects one lane per SIMD-group with a ballot, so a SIMD-group never contains both a holder
+  and a spinner. The tests check that the old values returned by 200,000 concurrent `atomicAdd`s form an
+  exact permutation and that `atomicExch` conserves every value. The price is serialization: a 64-bit CAS
+  retry loop with thousands of threads on one address is quadratic, at ~0.2 µs per attempt.
 * `__syncthreads_count` is `bar.red.popc`, which needs a scratch word and three barriers.
 * PTX's `mul24` is defined for any input, while MSL's is undefined outside ±2²³. That one was caught by a
   random-input test, not by reading the spec.
 
 The test suite compiles the same kernels at `-O3`, `-O1` and `-O0`, because the PTX differs wildly
-(the `-O0` build of one test file has 471 generic loads/stores and 29 `cvta`s). All 25 tests pass on all three.
+(the `-O0` build of one test file has 471 generic loads/stores and 29 `cvta`s). All 31 tests pass on all three.
 
 ## Part 4: does it work, and is it fast?
 
 `make test` from a clean tree runs:
 
 * the Driver API walk-through with nvcc-format PTX;
-* a 25-test conformance suite × 3 optimization levels, each against a CPU reference;
+* a 31-test conformance suite × 3 optimization levels, each against a CPU reference;
 * a normal CUDA C++ application with `<<<>>>` launches, templates, `__constant__` and `__device__`
   symbols, managed memory, streams, events and error handling, built with both launch ABIs;
 * Python: the Linux-style `libcuda.so.1` script, `metalcuda.enable()`, and NumPy-verified
@@ -258,8 +275,9 @@ was just as slow. The machine was in a degraded GPU state. Later in the session 
 * **Tensor cores, textures, non-inlined device calls, dynamic parallelism, grid sync** aren't translated yet.
   `mma.sync` → `simdgroup_matrix` is the obvious next step.
 * **Hardware differences** are reported honestly: 32 KiB of threadgroup memory (kernels asking for more
-  fail at launch with the CUDA error you'd expect), fp32 instead of fp64, limited 64-bit atomics, and
-  streams sharing one queue.
+  fail at launch with the CUDA error you'd expect), f64 that is exact but slow, 64-bit atomics that are
+  correct but serialized, and streams sharing one queue. The device properties say so:
+  `concurrentKernels`, `asyncEngineCount` and `deviceOverlap` are all 0.
 
 PyTorch is the elephant in the room. `torch` for macOS is built *without* its CUDA backend, so there's no
 `cudaLaunchKernel` call anywhere to intercept. Getting `torch.cuda` would mean compiling PyTorch's CUDA

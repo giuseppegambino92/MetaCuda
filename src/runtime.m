@@ -87,6 +87,7 @@ static _Atomic int g_sticky; /* sticky CUresult from asynchronous failures */
 static char g_cache_dir[1024];
 static int g_sync_each_launch;
 static int g_initialized;
+static uint64_t g_lock_table; /* GPU address of the 64-bit atomic lock table */
 
 #define LOCK() pthread_mutex_lock(&g_mtx)
 #define UNLOCK() pthread_mutex_unlock(&g_mtx)
@@ -404,6 +405,11 @@ static int file_exists(const char *p) {
  * are explicit), so by default Metal is not allowed to fuse mul+add on its own:
  * results then match the PTX bit for bit. METALCUDA_FP_CONTRACT=fast lets the
  * Metal compiler contract (what ptxas may do for non-.rn ops). */
+static const char *f64_mode(void) {
+    const char *e = getenv("METALCUDA_F64");
+    return e && !strcmp(e, "fast") ? "fast" : "exact";
+}
+
 static const char *fp_contract_pragma(void) {
     const char *e = getenv("METALCUDA_FP_CONTRACT");
     if (e && !strcmp(e, "fast")) return "#pragma METAL fp contract(fast)\n";
@@ -412,13 +418,21 @@ static const char *fp_contract_pragma(void) {
 
 static CUresult build_module(const char *ptx, size_t len, struct CUmod_st **out) {
     INIT();
+    LOCK();
+    if (!g_lock_table) {
+        alloc_t *lt;
+        if (mc_alloc(MC_LOCK_TABLE_BYTES, ALLOC_DEVICE, &lt) == CUDA_SUCCESS) g_lock_table = lt->gpu; /* zero-filled by mmap */
+    }
+    UNLOCK();
     double t0 = CACurrentMediaTime();
     struct CUmod_st *m = (struct CUmod_st *)calloc(1, sizeof *m);
     const char *pragma = fp_contract_pragma();
     {
-        size_t pl = strlen(pragma);
+        char policy[128];
+        snprintf(policy, sizeof policy, "%sf64=%s\n", pragma, f64_mode());
+        size_t pl = strlen(policy);
         char *keyed = (char *)malloc(len + pl);
-        memcpy(keyed, pragma, pl);
+        memcpy(keyed, policy, pl);
         memcpy(keyed + pl, ptx, len);
         sha256_hex(keyed, len + pl, m->hash);
         free(keyed);
@@ -643,13 +657,13 @@ MC_API CUresult cuDeviceGetAttribute(int *pi, CUdevice_attribute attrib, CUdevic
     case CU_DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_MULTIPROCESSOR: v = 65536; break;
     case CU_DEVICE_ATTRIBUTE_CLOCK_RATE: v = 1398000; break; /* kHz */
     case CU_DEVICE_ATTRIBUTE_TEXTURE_ALIGNMENT: v = 256; break;
-    case CU_DEVICE_ATTRIBUTE_GPU_OVERLAP: v = 1; break;
+    case CU_DEVICE_ATTRIBUTE_GPU_OVERLAP: v = 0; break;          /* no copy/compute overlap */
     case CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT: v = g_cores; break;
     case CU_DEVICE_ATTRIBUTE_KERNEL_EXEC_TIMEOUT: v = 1; break;
     case CU_DEVICE_ATTRIBUTE_INTEGRATED: v = 1; break;
     case CU_DEVICE_ATTRIBUTE_CAN_MAP_HOST_MEMORY: v = 1; break;
     case CU_DEVICE_ATTRIBUTE_COMPUTE_MODE: v = 0; break;
-    case CU_DEVICE_ATTRIBUTE_CONCURRENT_KERNELS: v = 1; break;
+    case CU_DEVICE_ATTRIBUTE_CONCURRENT_KERNELS: v = 0; break;   /* one in-order queue */
     case CU_DEVICE_ATTRIBUTE_ECC_ENABLED: v = 0; break;
     case CU_DEVICE_ATTRIBUTE_PCI_BUS_ID: case CU_DEVICE_ATTRIBUTE_PCI_DEVICE_ID: case CU_DEVICE_ATTRIBUTE_PCI_DOMAIN_ID: v = 0; break;
     case CU_DEVICE_ATTRIBUTE_TCC_DRIVER: v = 0; break;
@@ -657,7 +671,7 @@ MC_API CUresult cuDeviceGetAttribute(int *pi, CUdevice_attribute attrib, CUdevic
     case CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH: v = 384; break;
     case CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE: v = 8 * 1024 * 1024; break;
     case CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR: v = 2048; break;
-    case CU_DEVICE_ATTRIBUTE_ASYNC_ENGINE_COUNT: v = 1; break;
+    case CU_DEVICE_ATTRIBUTE_ASYNC_ENGINE_COUNT: v = 0; break;
     case CU_DEVICE_ATTRIBUTE_UNIFIED_ADDRESSING: v = 1; break;
     case CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR: v = 8; break;
     case CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: v = 0; break;
@@ -1367,6 +1381,7 @@ static CUresult launch(CUfunction f, unsigned gx, unsigned gy, unsigned gz, unsi
     uint64_t gbase = f->mod->globals ? f->mod->globals->gpu : 0;
     memcpy(block + k->hidden_offset, &gbase, 8);
     memcpy(block + k->hidden_offset + 8, &shmem, 4);
+    memcpy(block + k->hidden_offset + 16, &g_lock_table, 8);
     @autoreleasepool {
         id<MTLComputeCommandEncoder> enc = encoder();
         [enc setComputePipelineState:(__bridge id<MTLComputePipelineState>)f->pso];

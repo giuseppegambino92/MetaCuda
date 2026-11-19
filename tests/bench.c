@@ -108,6 +108,26 @@ int main(int argc, char **argv) {
     CK(cuEventElapsedTime(&ms, e0, e1));
     printf("  reduce_smem 16M floats          : %.3f ms/launch, %.0f GB/s\n", ms / 20, (double)big * 4 * 20 / (ms * 1e-3) / 1e9);
 
+    /* binary64: f64_ops = mul + fma + sqrt + sub per element (soft-float unless METALCUDA_F64=fast) */
+    {
+        CUfunction f64k;
+        CK(cuModuleGetFunction(&f64k, mb, "f64_ops"));
+        int nd = 1 << 22;
+        CUdeviceptr da, db, dc;
+        CK(cuMemAlloc(&da, (size_t)nd * 8)); CK(cuMemAlloc(&db, (size_t)nd * 8)); CK(cuMemAlloc(&dc, (size_t)nd * 8));
+        CK(cuMemsetD32(da, 0x3ff80000u, nd * 2)); CK(cuMemsetD32(db, 0x40080000u, nd * 2));
+        void *fa[] = {&da, &db, &dc, &nd};
+        CK(cuLaunchKernel(f64k, nd / 256, 1, 1, 256, 1, 1, 0, 0, fa, NULL));
+        CK(cuEventRecord(e0, 0));
+        for (int i = 0; i < 5; i++) CK(cuLaunchKernel(f64k, nd / 256, 1, 1, 256, 1, 1, 0, 0, fa, NULL));
+        CK(cuEventRecord(e1, 0));
+        CK(cuEventSynchronize(e1));
+        CK(cuEventElapsedTime(&ms, e0, e1));
+        const char *mode = getenv("METALCUDA_F64");
+        printf("  f64_ops 4M doubles (%s)        : %.3f ms/launch, %.0f M elements/s\n", mode && !strcmp(mode, "fast") ? "fast/fp32" : "exact IEEE",
+               ms / 5, nd * 5 / (ms * 1e-3) / 1e6);
+    }
+
     int M = 1024, N = 1024, K = 1024;
     void *ga[] = {&A, &B, &C, &M, &N, &K};
     CK(cuLaunchKernel(sgemm, N / 16, M / 16, 1, 16, 16, 1, 0, 0, ga, NULL));

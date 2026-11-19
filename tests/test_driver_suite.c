@@ -61,7 +61,7 @@ static CUfunction fn(CUmodule m, const char *name) {
     return f;
 }
 
-static CUmodule M_basic, M_par, M_glob;
+static CUmodule M_basic, M_par, M_glob, M_prec;
 
 /* ------------------------------------------------------------------ basic */
 
@@ -246,8 +246,8 @@ static int t_f64(void) {
     CK(cuMemcpyDtoH(c, dc, n * 8));
     for (int i = 0; i < n; i++) {
         double ref = a[i] * b[i] + 0.5 * a[i] - sqrt(fabs(b[i]));
-        /* f64 is computed in fp32 on Metal: check fp32-level accuracy */
-        EXPECT(fabs(c[i] - ref) <= 2e-6 * fmax(1.0, fabs(a[i] * b[i])), "f64[%d] %.10g != %.10g", i, c[i], ref);
+        /* loose enough for METALCUDA_F64=fast (fp32 compute); exact mode is checked bit for bit by f64_exact */
+        EXPECT(fabs(c[i] - ref) <= 2e-6 * fmax(1.0, fmax(fabs(ref), fabs(a[i] * b[i]))), "f64[%d] %.10g != %.10g", i, c[i], ref);
     }
     cuMemFree(da); cuMemFree(db); cuMemFree(dc);
     free(a); free(b); free(c);
@@ -595,6 +595,242 @@ static int t_irreducible(void) {
     return 1;
 }
 
+
+
+/* Async copies on a stream: stream order (HtoD -> kernel -> DtoH), the host
+ * source may be reused/freed as soon as cuMemcpyHtoDAsync returns, and the
+ * reported capabilities match the implementation (no concurrency claimed). */
+static int t_async_semantics(void) {
+    CUfunction f = fn(M_basic, "saxpy");
+    int n = 1 << 20;
+    float alpha = 2.0f;
+    CUstream s;
+    CK(cuStreamCreate(&s, CU_STREAM_NON_BLOCKING));
+    CUdeviceptr dx, dy;
+    CK(cuMemAlloc(&dx, (size_t)n * 4)); CK(cuMemAlloc(&dy, (size_t)n * 4));
+    float *out = malloc((size_t)n * 4);
+    for (int round = 0; round < 3; round++) {
+        float *hx = malloc((size_t)n * 4), *hy = malloc((size_t)n * 4);
+        for (int i = 0; i < n; i++) { hx[i] = (float)(i % 1000) + round; hy[i] = 1.0f; }
+        CK(cuMemcpyHtoDAsync(dx, hx, (size_t)n * 4, s));
+        CK(cuMemcpyHtoDAsync(dy, hy, (size_t)n * 4, s));
+        memset(hx, 0xFF, (size_t)n * 4); /* reuse the source immediately ... */
+        free(hx);                         /* ... and free it */
+        free(hy);
+        void *args[] = {&n, &alpha, &dx, &dy};
+        CK(cuLaunchKernel(f, 256, 1, 1, 256, 1, 1, 0, s, args, NULL));
+        CK(cuMemcpyDtoHAsync(out, dy, (size_t)n * 4, s)); /* must observe the kernel's writes */
+        CK(cuStreamSynchronize(s));
+        for (int i = 0; i < n; i++)
+            EXPECT(out[i] == alpha * ((float)(i % 1000) + round) + 1.0f, "round %d [%d]: %f", round, i, out[i]);
+    }
+    int conc = -1, overlap = -1, engines = -1;
+    CK(cuDeviceGetAttribute(&conc, CU_DEVICE_ATTRIBUTE_CONCURRENT_KERNELS, 0));
+    CK(cuDeviceGetAttribute(&overlap, CU_DEVICE_ATTRIBUTE_GPU_OVERLAP, 0));
+    CK(cuDeviceGetAttribute(&engines, CU_DEVICE_ATTRIBUTE_ASYNC_ENGINE_COUNT, 0));
+    EXPECT(conc == 0 && overlap == 0 && engines == 0, "capabilities must not claim concurrency (%d %d %d)", conc, overlap, engines);
+    cuMemFree(dx); cuMemFree(dy); cuStreamDestroy(s);
+    free(out);
+    return 1;
+}
+
+/* ------------------------------------------------------ 64-bit atomics */
+
+static int cmp_u64(const void *a, const void *b) {
+    unsigned long long x = *(const unsigned long long *)a, y = *(const unsigned long long *)b;
+    return x < y ? -1 : x > y;
+}
+
+static int t_atom64_unique(void) {
+    CUfunction f = fn(M_prec, "atom64_add_unique");
+    int n = 200000;
+    unsigned long long incs[2] = {1ull, 0x100000001ull};
+    unsigned long long *olds = malloc((size_t)n * 8);
+    CUdeviceptr dc, dol;
+    CK(cuMemAlloc(&dc, 8)); CK(cuMemAlloc(&dol, (size_t)n * 8));
+    for (int t = 0; t < 2; t++) {
+        unsigned long long start = 0xFFFFFF00ull, inc = incs[t], fin;
+        CK(cuMemcpyHtoD(dc, &start, 8));
+        void *args[] = {&dc, &dol, &inc, &n};
+        CK(cuLaunchKernel(f, (n + 255) / 256, 1, 1, 256, 1, 1, 0, 0, args, NULL));
+        CK(cuMemcpyDtoH(olds, dol, (size_t)n * 8));
+        CK(cuMemcpyDtoH(&fin, dc, 8));
+        EXPECT(fin == start + (unsigned long long)n * inc, "final counter 0x%llx want 0x%llx", fin, start + (unsigned long long)n * inc);
+        qsort(olds, (size_t)n, 8, cmp_u64);
+        for (int i = 0; i < n; i++)
+            EXPECT(olds[i] == start + (unsigned long long)i * inc, "inc 0x%llx: returned old values are not a permutation (rank %d: 0x%llx want 0x%llx)",
+                   inc, i, olds[i], start + (unsigned long long)i * inc);
+    }
+    cuMemFree(dc); cuMemFree(dol);
+    free(olds);
+    return 1;
+}
+
+static int t_atom64_misc(void) {
+    CUfunction f = fn(M_prec, "atom64_misc");
+    /* every thread runs a 64-bit CAS retry loop on ONE address: O(n^2) lock-protected
+     * attempts, so keep n moderate (see README: 64-bit atomics) */
+    int n = 4096;
+    const unsigned long long K = 0xF0F0F0F0F0F0ull;
+    unsigned long long init[5] = {0xFFFFFFFFull, 0x42ull, 0x1ull, 0xFFFFFFFFFFFFFFFFull, 0};
+    long long sinit = (long long)0x8000000000000000ull;
+    CUdeviceptr d[5], dxo, dmo, dsm;
+    for (int i = 0; i < 4; i++) { CK(cuMemAlloc(&d[i], 8)); CK(cuMemcpyHtoD(d[i], &init[i], 8)); }
+    CK(cuMemAlloc(&dsm, 8)); CK(cuMemcpyHtoD(dsm, &sinit, 8));
+    CK(cuMemAlloc(&dxo, (size_t)n * 8)); CK(cuMemAlloc(&dmo, (size_t)n * 8));
+    void *args[] = {&d[0], &d[1], &dxo, &d[2], &d[3], &dmo, &dsm, &n};
+    CK(cuLaunchKernel(f, (n + 127) / 128, 1, 1, 128, 1, 1, 0, 0, args, NULL));
+    unsigned long long fin[4];
+    long long sfin;
+    for (int i = 0; i < 4; i++) CK(cuMemcpyDtoH(&fin[i], d[i], 8));
+    CK(cuMemcpyDtoH(&sfin, dsm, 8));
+    EXPECT(fin[0] == init[0] + (unsigned long long)n * 0x100000001ull, "64-bit CAS loop counter 0x%llx", fin[0]);
+    /* exchange conservation: returned values + final == initial + all written values */
+    unsigned long long *got = malloc((size_t)(n + 1) * 8), *want = malloc((size_t)(n + 1) * 8), *mo = malloc((size_t)n * 8);
+    CK(cuMemcpyDtoH(got, dxo, (size_t)n * 8));
+    CK(cuMemcpyDtoH(mo, dmo, (size_t)n * 8));
+    got[n] = fin[1];
+    want[n] = init[1];
+    unsigned long long mx = init[2], mn = init[3];
+    long long smx = sinit;
+    for (int i = 0; i < n; i++) {
+        unsigned long long v = 0x123456789ull * (unsigned long long)(i + 1);
+        want[i] = v;
+        if ((v ^ K) > mx) mx = v ^ K;
+        if ((v ^ K) < mn) mn = v ^ K;
+        if ((long long)(v ^ 0x8000000000000000ull) > smx) smx = (long long)(v ^ 0x8000000000000000ull);
+    }
+    qsort(got, (size_t)n + 1, 8, cmp_u64);
+    qsort(want, (size_t)n + 1, 8, cmp_u64);
+    for (int i = 0; i <= n; i++) EXPECT(got[i] == want[i], "64-bit exchange lost or duplicated a value (rank %d)", i);
+    EXPECT(fin[2] == mx && fin[3] == mn && sfin == smx, "64-bit min/max 0x%llx 0x%llx %lld", fin[2], fin[3], sfin);
+    for (int i = 0; i < n; i++) EXPECT(mo[i] <= mx, "atomicMax returned a value above the final maximum");
+    for (int i = 0; i < 4; i++) cuMemFree(d[i]);
+    cuMemFree(dsm); cuMemFree(dxo); cuMemFree(dmo);
+    free(got); free(want); free(mo);
+    return 1;
+}
+
+static int t_atom64_shared(void) {
+    CUfunction f = fn(M_prec, "atom64_shared");
+    int blocks = 16, threads = 512, n = blocks * threads;
+    unsigned long long *olds = malloc((size_t)n * 8), tot[16];
+    CUdeviceptr dol, dt;
+    CK(cuMemAlloc(&dol, (size_t)n * 8)); CK(cuMemAlloc(&dt, sizeof tot));
+    void *args[] = {&dol, &dt};
+    CK(cuLaunchKernel(f, blocks, 1, 1, threads, 1, 1, 0, 0, args, NULL));
+    CK(cuMemcpyDtoH(olds, dol, (size_t)n * 8));
+    CK(cuMemcpyDtoH(tot, dt, sizeof tot));
+    for (int b = 0; b < blocks; b++) {
+        EXPECT(tot[b] == 0xFFFFFFF0ull + (unsigned long long)threads, "shared 64-bit counter block %d: 0x%llx", b, tot[b]);
+        qsort(olds + b * threads, (size_t)threads, 8, cmp_u64);
+        for (int t = 0; t < threads; t++) EXPECT(olds[b * threads + t] == 0xFFFFFFF0ull + (unsigned long long)t, "shared 64-bit old values block %d", b);
+    }
+    cuMemFree(dol); cuMemFree(dt);
+    free(olds);
+    return 1;
+}
+
+static int t_atom_f64(void) {
+    CUfunction f = fn(M_prec, "atom_f64_add");
+    int n = 100000;
+    double *v = malloc((size_t)n * 8), ref = 0, sum = 0;
+    for (int i = 0; i < n; i++) { v[i] = (double)(int)(rnd() % 2001 - 1000) / 1024.0 + (double)(rnd() % 1000) * 4096.0; ref += v[i]; }
+    CUdeviceptr dv, ds;
+    CK(cuMemAlloc(&dv, (size_t)n * 8)); CK(cuMemAlloc(&ds, 8));
+    CK(cuMemcpyHtoD(dv, v, (size_t)n * 8)); CK(cuMemcpyHtoD(ds, &sum, 8));
+    void *args[] = {&dv, &ds, &n};
+    CK(cuLaunchKernel(f, (n + 255) / 256, 1, 1, 256, 1, 1, 0, 0, args, NULL));
+    CK(cuMemcpyDtoH(&sum, ds, 8));
+    EXPECT(sum == ref, "double atomicAdd %.17g want %.17g (all partial sums are exactly representable)", sum, ref);
+    cuMemFree(dv); cuMemFree(ds);
+    free(v);
+    return 1;
+}
+
+/* ------------------------------------------------------ IEEE binary64 */
+
+static unsigned long long dbits(double d) { unsigned long long u; memcpy(&u, &d, 8); return u; }
+static double bitsd(unsigned long long u) { double d; memcpy(&d, &u, 8); return d; }
+static unsigned long long rnd64(void) { return ((unsigned long long)rnd() << 32) | rnd(); }
+
+static double gen_double(int i) {
+    static const double special[] = {0.0, -0.0, 1.0, -1.0, 0.5, 1.5, 2.5, -2.5, 3.0, 1e308, -1e308, 4.9e-324, 2.2250738585072014e-308,
+                                     2.225073858507201e-308, 9007199254740993.0, 1.7976931348623157e308, 0.1, 1e-300, 1e300, 123456789.987654321};
+    int nsp = (int)(sizeof special / sizeof special[0]);
+    switch (i % 5) {
+    case 0: return special[rnd() % nsp] * ((rnd() & 1) ? 1.0 : -1.0);
+    case 1: return bitsd(rnd64());                                                     /* any class incl. NaN/inf/subnormal */
+    case 2: return bitsd((rnd64() & 0x800FFFFFFFFFFFFFull) | (0x3FEull << 52) | ((unsigned long long)(rnd() % 4) << 52)); /* similar magnitudes: cancellation */
+    case 3: return bitsd((rnd64() & 0x800FFFFFFFFFFFFFull) | ((unsigned long long)(rnd() % 120) << 52));                   /* near underflow */
+    default: return ldexp((double)(int)(rnd() % 2000001 - 1000000) + (double)rnd() / 4294967296.0, (int)(rnd() % 80) - 40);
+    }
+}
+
+static int same_bits(unsigned long long got, double want, int zero_sign_free) {
+    if (want != want) return (got & 0x7FFFFFFFFFFFFFFFull) > 0x7FF0000000000000ull;
+    if (zero_sign_free && want == 0.0) return (got & 0x7FFFFFFFFFFFFFFFull) == 0;
+    return got == dbits(want);
+}
+/* PTX min/max.f64: a NaN operand (quiet or signalling) yields the other operand */
+static double ptx_fmin(double x, double y) { return x != x ? y : (y != y ? x : fmin(x, y)); }
+static double ptx_fmax(double x, double y) { return x != x ? y : (y != y ? x : fmax(x, y)); }
+static int sat_d2i_rn(double y) {
+    if (y != y) return 0;
+    double r = rint(y);
+    if (r >= 2147483647.0) return 2147483647;
+    if (r <= -2147483648.0) return (-2147483647 - 1);
+    return (int)r;
+}
+
+static int t_f64_exact(void) {
+    CUfunction f = fn(M_prec, "f64_exact");
+    int n = 1 << 18;
+    double *a = malloc((size_t)n * 8), *b = malloc((size_t)n * 8), *c = malloc((size_t)n * 8);
+    unsigned long long *o = malloc((size_t)n * 12 * 8);
+    int *io = malloc((size_t)n * 16);
+    float *fo = malloc((size_t)n * 4);
+    for (int i = 0; i < n; i++) {
+        a[i] = gen_double(i);
+        b[i] = (i % 7 == 2) ? a[i] * (1.0 + ldexp(1.0, -(int)(rnd() % 53))) : gen_double(i / 3 + (int)(rnd() % 5));
+        c[i] = (i % 11 == 3) ? -(a[i] * b[i]) : gen_double(i + 1);
+    }
+    CUdeviceptr da, db, dc, dout, dio, dfo;
+    CK(cuMemAlloc(&da, (size_t)n * 8)); CK(cuMemAlloc(&db, (size_t)n * 8)); CK(cuMemAlloc(&dc, (size_t)n * 8));
+    CK(cuMemAlloc(&dout, (size_t)n * 96)); CK(cuMemAlloc(&dio, (size_t)n * 16)); CK(cuMemAlloc(&dfo, (size_t)n * 4));
+    CK(cuMemcpyHtoD(da, a, (size_t)n * 8)); CK(cuMemcpyHtoD(db, b, (size_t)n * 8)); CK(cuMemcpyHtoD(dc, c, (size_t)n * 8));
+    void *args[] = {&da, &db, &dc, &dout, &dio, &dfo, &n};
+    CK(cuLaunchKernel(f, (n + 255) / 256, 1, 1, 256, 1, 1, 0, 0, args, NULL));
+    CK(cuMemcpyDtoH(o, dout, (size_t)n * 96)); CK(cuMemcpyDtoH(io, dio, (size_t)n * 16)); CK(cuMemcpyDtoH(fo, dfo, (size_t)n * 4));
+    static const char *names[12] = {"add", "sub", "mul", "div", "sqrt", "fma", "min", "max", "i64->f64*0.1", "floor+ceil", "f64->f32->f64", "rint"};
+    long bad[12] = {0};
+    long ibad = 0;
+    for (int i = 0; i < n; i++) {
+        double x = a[i], y = b[i], z = c[i];
+        double ref[12] = {x + y, x - y, x * y, x / y, sqrt(x), fma(x, y, z), ptx_fmin(x, y), ptx_fmax(x, y), (double)(long long)i * 0.1,
+                          floor(x) + ceil(y), (double)(float)z, rint(x)};
+        for (int k = 0; k < 12; k++)
+            if (!same_bits(o[12 * i + k], ref[k], k == 6 || k == 7)) {
+                if (bad[k]++ < 3)
+                    fprintf(stderr, "  f64 %s(%a, %a, %a): got %a want %a\n", names[k], x, y, z, bitsd(o[12 * i + k]), ref[k]);
+            }
+        int iref[4] = {(x < y) | ((x == y) << 1) | ((x > y) << 2) | ((x != x) << 3), (int)ptx_fmin(ptx_fmax(x, -2e9), 2e9), sat_d2i_rn(y),
+                       (int)(long long)ptx_fmin(ptx_fmax(z, -9e18), 9e18)};
+        for (int k = 0; k < 4; k++)
+            if (io[4 * i + k] != iref[k] && ibad++ < 3) fprintf(stderr, "  f64 int op %d (%a, %a, %a): got %d want %d\n", k, x, y, z, io[4 * i + k], iref[k]);
+        float fr = (float)x;
+        if (memcmp(&fr, &fo[i], 4) && !(fr != fr && fo[i] != fo[i]) && ibad++ < 3) fprintf(stderr, "  f64->f32 %a: got %a want %a\n", x, fo[i], fr);
+    }
+    long total = ibad;
+    for (int k = 0; k < 12; k++) total += bad[k];
+    cuMemFree(da); cuMemFree(db); cuMemFree(dc); cuMemFree(dout); cuMemFree(dio); cuMemFree(dfo);
+    free(a); free(b); free(c); free(o); free(io); free(fo);
+    for (int k = 0; k < 12; k++) if (bad[k]) fprintf(stderr, "  %s: %ld mismatches\n", names[k], bad[k]);
+    if (ibad) fprintf(stderr, "  integer/f32 conversions & compares: %ld mismatches\n", ibad);
+    EXPECT(total == 0, "%ld of %d results differ from IEEE binary64", total, n * 17);
+    return 1;
+}
+
 /* ---------------------------------------------------------------- globals */
 
 static int t_globals(void) {
@@ -824,7 +1060,9 @@ static int t_many_launches(void) {
 typedef struct { const char *name; int (*fn)(void); } test_t;
 
 int main(int argc, char **argv) {
+    setvbuf(stdout, NULL, _IONBF, 0);
     if (argc > 1) g_dir = argv[1];
+    const char *only = argc > 2 ? argv[2] : NULL; /* optional: run tests whose name contains this */
     if (cuInit(0)) { fprintf(stderr, "cuInit failed\n"); return 1; }
     CUdevice dev;
     CUcontext ctx;
@@ -837,14 +1075,15 @@ int main(int argc, char **argv) {
     M_basic = load("basic");
     M_par = load("parallel");
     M_glob = load("globals");
-    if (!M_basic || !M_par || !M_glob) return 1;
+    M_prec = load("precision");
+    if (!M_basic || !M_par || !M_glob || !M_prec) return 1;
     test_t tests[] = {
         {"vecadd (1M elems, odd size)", t_vecadd},
         {"saxpy grid-stride + extra param buffer", t_saxpy_gridstride_and_extra},
         {"integer & bit ops (popc/clz/brev/prmt/shf/mulhi/div/mul24)", t_int_ops},
         {"float ops & conversions (rounding, saturation)", t_float_ops},
         {"by-value struct parameter", t_struct_param},
-        {"f64 (binary64 memory, fp32 compute)", t_f64},
+        {"f64 kernel (a*b + 0.5a - sqrt|b|)", t_f64},
         {"3-D grid / 2-D blocks", t_grid3d},
         {"8/16-bit loads, sign extension", t_small_types},
         {"shared-memory tree reduction + float atomicAdd", t_reduce_smem},
@@ -858,14 +1097,21 @@ int main(int argc, char **argv) {
         {"__syncthreads_count/and/or (bar.red)", t_sync_count},
         {"divergent loop then barrier + shuffle (loop-exit placement)", t_loop_then_barrier},
         {"irreducible CFG (hand-written PTX, dispatch-loop fallback)", t_irreducible},
+        {"64-bit atomicAdd: returned old values are a permutation", t_atom64_unique},
+        {"64-bit CAS loop, exchange conservation, min/max", t_atom64_misc},
+        {"64-bit atomics in shared memory", t_atom64_shared},
+        {"double atomicAdd (exact sum)", t_atom_f64},
+        {"IEEE binary64: 17 ops x 262k inputs, bit-exact vs CPU", t_f64_exact},
         {"__constant__ / __device__ globals + cuModuleGetGlobal", t_globals},
         {"managed, pinned, registered memory; memset; DtoD", t_memory_kinds},
         {"virtual memory management (reserve/create/map)", t_vmm},
         {"streams & events timing", t_events_streams},
+        {"async copies: stream order, source reuse, honest capabilities", t_async_semantics},
         {"error paths & cuGetProcAddress", t_errors_and_queries},
         {"10k dependent launches", t_many_launches},
     };
     for (size_t i = 0; i < sizeof tests / sizeof tests[0]; i++) {
+        if (only && !strstr(tests[i].name, only)) continue;
         int ok = tests[i].fn();
         printf("  [%s] %s\n", ok ? "PASS" : "FAIL", tests[i].name);
         if (ok) g_pass++;

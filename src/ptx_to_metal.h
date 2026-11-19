@@ -8,8 +8,9 @@
  * ABI contract between the translator and the runtime (see runtime.m):
  *   buffer(0)      : `constant uchar* __params` — the CUDA kernel parameter
  *                    block, laid out exactly like CUDA's (each param at its
- *                    natural/declared alignment), followed by a 16-byte hidden
- *                    block at `hidden_offset`: { u64 globals_base; u32 dyn_smem; u32 pad }.
+ *                    natural/declared alignment), followed by a 24-byte hidden
+ *                    block at `hidden_offset`: { u64 globals_base; u32 dyn_smem; u32 pad;
+ *                    u64 lock_table } (lock_table: MC_LOCK_TABLE_BYTES used by 64-bit atomics).
  *   threadgroup(0) : `threadgroup uchar* __smem` (only if `uses_smem`) —
  *                    static shared variables at [0, smem_dyn_offset), dynamic
  *                    (`extern .shared`) memory starting at `smem_dyn_offset`.
@@ -26,8 +27,10 @@
 extern "C" {
 #endif
 
-#define MC_TRANSLATOR_VERSION "metacuda-ptx2msl-1.0"
+#define MC_TRANSLATOR_VERSION "metacuda-ptx2msl-1.1"
 #define MC_MAX_NAME 256
+#define MC_HIDDEN_BYTES 24u
+#define MC_LOCK_TABLE_BYTES (16384u * 4u)
 
 typedef struct {
     char     name[MC_MAX_NAME];
@@ -43,7 +46,7 @@ typedef struct {
     int         nparams;
     uint32_t    param_bytes;            /* size of the user parameter area   */
     uint32_t    hidden_offset;          /* offset of the hidden block         */
-    uint32_t    total_param_bytes;      /* hidden_offset + 16                 */
+    uint32_t    total_param_bytes;      /* hidden_offset + MC_HIDDEN_BYTES    */
     int         uses_smem;              /* kernel takes threadgroup(0)        */
     uint32_t    smem_dyn_offset;        /* where extern shared memory starts  */
     uint32_t    static_smem;            /* bytes of static shared memory      */

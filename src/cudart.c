@@ -145,13 +145,13 @@ MC_API cudaError_t cudaGetDeviceProperties_v2(struct cudaDeviceProp *p, int devi
     p->minor = A(CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR);
     p->textureAlignment = 256;
     p->texturePitchAlignment = 256;
-    p->deviceOverlap = 1;
+    p->deviceOverlap = 0;     /* copies are CPU memcpys after a GPU sync: no copy/compute overlap */
     p->multiProcessorCount = mc_gpu_cores();
     p->kernelExecTimeoutEnabled = 1;
     p->integrated = 1;
     p->canMapHostMemory = 1;
-    p->concurrentKernels = 1;
-    p->asyncEngineCount = 1;
+    p->concurrentKernels = 0; /* all streams share one in-order Metal queue */
+    p->asyncEngineCount = 0;
     p->unifiedAddressing = 1;
     p->memoryClockRate = A(CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE);
     p->memoryBusWidth = A(CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH);

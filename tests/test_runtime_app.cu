@@ -120,9 +120,10 @@ int main() {
     cudaRuntimeGetVersion(&rt);
     cudaDriverGetVersion(&drv);
     std::printf("CUDA runtime %d / driver %d, %d device(s)\n", rt, drv, count);
-    std::printf("device 0: %s, sm_%d%d, %d SMs, %.1f GiB, %zu B shared/block, warp %d, unified addressing %d\n", prop.name, prop.major,
-                prop.minor, prop.multiProcessorCount, prop.totalGlobalMem / 1073741824.0, prop.sharedMemPerBlock, prop.warpSize,
-                prop.unifiedAddressing);
+    std::printf("device 0: %s, sm_%d%d, %d SMs, %.1f GiB, %zu B shared/block, warp %d, unified addressing %d, concurrent kernels %d\n",
+                prop.name, prop.major, prop.minor, prop.multiProcessorCount, prop.totalGlobalMem / 1073741824.0, prop.sharedMemPerBlock,
+                prop.warpSize, prop.unifiedAddressing, prop.concurrentKernels);
+    REQUIRE(prop.concurrentKernels == 0 && prop.asyncEngineCount == 0 && prop.deviceOverlap == 0, "device must not claim concurrency it lacks");
     CUDA_CHECK(cudaSetDevice(0));
 
     // ---- mandelbrot ----

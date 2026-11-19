@@ -24,6 +24,7 @@
  * stay compatible. A warning is recorded when this happens.
  */
 #include "ptx_to_metal.h"
+#include "softfloat64.inc" /* MC_SOFTFLOAT64_MSL: generated from softfloat64.metal */
 
 #include <ctype.h>
 #include <stdarg.h>
@@ -74,15 +75,21 @@ enum {
     VT_PRED = 0, VT_U8, VT_S8, VT_U16, VT_S16, VT_U32, VT_S32, VT_U64, VT_S64,
     VT_F16, VT_BF16, VT_F32, VT_F64, VT_COUNT
 };
-static const char *VT_C[VT_COUNT] = {"bool", "uchar", "char", "ushort", "short", "uint", "int",
-                                     "ulong", "long", "half", "ushort", "float", "float"};
+/* f64 policy (per translation): exact = IEEE binary64 in software, values kept as
+ * their bit patterns in ulong registers; fast = computed in fp32 (opt-in). */
+static __thread int g_f64x = 1;
+static const char *VT_C_FAST[VT_COUNT] = {"bool", "uchar", "char", "ushort", "short", "uint", "int",
+                                          "ulong", "long", "half", "ushort", "float", "float"};
+static const char *VT_C_EXACT[VT_COUNT] = {"bool", "uchar", "char", "ushort", "short", "uint", "int",
+                                           "ulong", "long", "half", "ushort", "float", "ulong"};
+#define VT_C (g_f64x ? VT_C_EXACT : VT_C_FAST)
 static const int VT_SIZE[VT_COUNT] = {1, 1, 1, 2, 2, 4, 4, 8, 8, 2, 2, 4, 8};
 
 static int vt_isint(int v) { return v >= VT_U8 && v <= VT_S64; }
 static int vt_issigned(int v) { return v == VT_S8 || v == VT_S16 || v == VT_S32 || v == VT_S64; }
 /* float *storage* (C type is a floating type). BF16 is stored as ushort bits. */
-static int vt_fltstore(int v) { return v == VT_F16 || v == VT_F32 || v == VT_F64; }
-static int vt_isfloat(int v) { return vt_fltstore(v) || v == VT_BF16; }
+static int vt_fltstore(int v) { return v == VT_F16 || v == VT_F32 || (v == VT_F64 && !g_f64x); }
+static int vt_isfloat(int v) { return vt_fltstore(v) || v == VT_BF16 || v == VT_F64; }
 static int vt_unsigned_of_size(int bytes) {
     switch (bytes) { case 1: return VT_U8; case 2: return VT_U16; case 4: return VT_U32; default: return VT_U64; }
 }
@@ -849,6 +856,7 @@ static int parse_module(P *p) {
 
 /* ───────────────────────────── emitter ───────────────────────────── */
 
+#define MC_LOCK_COUNT 16384u /* entries in the 64-bit atomic lock table (power of two) */
 #define TAG_SHARED 0xFFFFull
 #define TAG_LOCAL  0xFFFEull
 #define TAG_PARAM  0xFFFDull
@@ -946,6 +954,16 @@ static int special_reg(K *k, const char *n, char *out, size_t on, int *vt) {
 static void imm_expr(char *out, size_t n, const operand_t *op, int vt) {
     uint64_t b = op->bits;
     if (vt == VT_PRED) { snprintf(out, n, "%s", b ? "true" : "false"); return; }
+    if (g_f64x && vt == VT_F64) { /* binary64 bit pattern, converted at translation time */
+        double d;
+        if (op->imm_kind == 0) d = (double)(int64_t)b;
+        else if (op->imm_kind == 1) { uint32_t u = (uint32_t)b; float f; memcpy(&f, &u, 4); d = f; }
+        else memcpy(&d, &b, 8);
+        uint64_t bits;
+        memcpy(&bits, &d, 8);
+        snprintf(out, n, "0x%llxul", (unsigned long long)bits);
+        return;
+    }
     if (op->imm_kind == 0) {
         if (vt_isfloat(vt)) {
             int64_t sv = (int64_t)b;
@@ -1206,7 +1224,7 @@ static int emit_ldst(K *k, instr_t *in, int is_store) {
     char a[EXL];
     int sp = space;
     if (!addr_expr(k, mop, &sp, a, sizeof a)) return 0;
-    if (vt == VT_F64 && !k->p->warned_f64) { k->p->warned_f64 = 1; warn(k->p, "f64 arithmetic is emulated in fp32 (Metal has no double); memory layout stays binary64"); }
+    if (vt == VT_F64 && !g_f64x && !k->p->warned_f64) { k->p->warned_f64 = 1; warn(k->p, "METALCUDA_F64=fast: f64 arithmetic is computed in fp32 (memory layout stays binary64)"); }
     const char *ct = mem_ctype(vt);
     int es = VT_SIZE[vt == VT_PRED ? VT_U8 : vt];
     int local_param = (sp == -SP_PARAM);
@@ -1225,7 +1243,7 @@ static int emit_ldst(K *k, instr_t *in, int is_store) {
         if (is_store) {
             char v[EXL], vv[EXL];
             if (!rd(k, val, vt, v, sizeof v)) return 0;
-            if (vt == VT_F64) snprintf(vv, sizeof vv, "__d_bits(%s)", v);
+            if (vt == VT_F64 && !g_f64x) snprintf(vv, sizeof vv, "__d_bits(%s)", v);
             else if (vt == VT_PRED) snprintf(vv, sizeof vv, "(uchar)(%s)", v);
             else snprintf(vv, sizeof vv, "%s", v);
             if (isgen) generic_store(k, ct, ae, vv, vol);
@@ -1235,7 +1253,7 @@ static int emit_ldst(K *k, instr_t *in, int is_store) {
             char g[EXL], v[EXL];
             if (isgen) generic_load(k, g, sizeof g, ct, ae, vol);
             else snprintf(g, sizeof g, "%s", m);
-            if (vt == VT_F64) snprintf(v, sizeof v, "__d_from_bits(%s)", g);
+            if (vt == VT_F64 && !g_f64x) snprintf(v, sizeof v, "__d_from_bits(%s)", g);
             else snprintf(v, sizeof v, "%s", g);
             if (!wr(k, val, v, vt)) return 0;
         }
@@ -1278,6 +1296,15 @@ static int cmp_float(char *out, size_t n, const char *c, const char *a, const ch
 static int compare_expr(K *k, instr_t *in, int vt, const operand_t *A, const operand_t *B, char *out, size_t n) {
     const char *c = in->parts[1];
     char a[EXL], b[EXL];
+    if (g_f64x && vt == VT_F64) {
+        static const char *cmps[] = {"eq", "ne", "lt", "le", "gt", "ge", "equ", "neu", "ltu", "leu", "gtu", "geu", "num", "nan"};
+        int code = -1;
+        for (int i = 0; i < 14; i++) if (!strcmp(c, cmps[i])) code = i;
+        if (code < 0) { PERR(k->p, "PTX line %d: bad float comparison '%s'", in->line, c); return 0; }
+        if (!rd(k, A, VT_F64, a, sizeof a) || !rd(k, B, VT_F64, b, sizeof b)) return 0;
+        snprintf(out, n, "__dsetp(%s, %s, %du)", a, b, code);
+        return 1;
+    }
     if (vt_isfloat(vt)) {
         if (!rdn(k, A, vt, a, sizeof a) || !rdn(k, B, vt, b, sizeof b)) return 0;
         if (!cmp_float(out, n, c, a, b)) { PERR(k->p, "PTX line %d: bad float comparison '%s'", in->line, c); return 0; }
@@ -1327,10 +1354,61 @@ static void f2i(char *out, size_t n, const char *f, int dt) {
     }
 }
 
+static int round_mode(instr_t *in, int dflt) {
+    for (int i = 1; i < in->np; i++) {
+        const char *s = in->parts[i];
+        if (!strcmp(s, "rni") || !strcmp(s, "rn")) return 0;
+        if (!strcmp(s, "rzi") || !strcmp(s, "rz")) return 1;
+        if (!strcmp(s, "rmi") || !strcmp(s, "rm")) return 2;
+        if (!strcmp(s, "rpi") || !strcmp(s, "rp")) return 3;
+    }
+    return dflt;
+}
+
+/* cvt with an f64 source or destination in exact mode */
+static int emit_cvt_f64(K *k, instr_t *in, int dt, int st) {
+    char a[EXL], r[EXL], t[EXL];
+    if (st == VT_F64) {
+        if (!rd(k, &in->ops[1], VT_F64, a, sizeof a)) return 0;
+        if (dt == VT_F64) {
+            if (rounding_fn(in)) snprintf(r, sizeof r, "__dround(%s, %du)", a, round_mode(in, 0));
+            else snprintf(r, sizeof r, "%s", a);
+            if (has_part(in, "sat")) { snprintf(t, sizeof t, "__dmin(__dmax(%s, 0ul), 0x3FF0000000000000ul)", r); snprintf(r, sizeof r, "%s", t); }
+            return wr(k, &in->ops[0], r, VT_F64);
+        }
+        if (dt == VT_F32) { snprintf(r, sizeof r, "__d_from_bits(%s)", a); return wr(k, &in->ops[0], r, VT_F32); }
+        if (dt == VT_F16) { snprintf(r, sizeof r, "((half)__d_from_bits(%s))", a); return wr(k, &in->ops[0], r, VT_F16); }
+        if (dt == VT_BF16) { snprintf(r, sizeof r, "__f2bf(__d_from_bits(%s))", a); return wr(k, &in->ops[0], r, VT_U16); }
+        snprintf(t, sizeof t, "__dround(%s, %du)", a, round_mode(in, 1));
+        switch (dt) {
+        case VT_S64: snprintf(r, sizeof r, "__d2s64(%s)", t); break;
+        case VT_U64: snprintf(r, sizeof r, "__d2u64(%s)", t); break;
+        case VT_S32: snprintf(r, sizeof r, "((int)clamp(__d2s64(%s), -2147483648l, 2147483647l))", t); break;
+        case VT_U32: snprintf(r, sizeof r, "((uint)min(__d2u64(%s), 0xFFFFFFFFul))", t); break;
+        case VT_S16: snprintf(r, sizeof r, "((short)clamp(__d2s64(%s), -32768l, 32767l))", t); break;
+        case VT_U16: snprintf(r, sizeof r, "((ushort)min(__d2u64(%s), 65535ul))", t); break;
+        case VT_S8: snprintf(r, sizeof r, "((char)clamp(__d2s64(%s), -128l, 127l))", t); break;
+        default: snprintf(r, sizeof r, "((uchar)min(__d2u64(%s), 255ul))", t); break;
+        }
+        return wr(k, &in->ops[0], r, dt);
+    }
+    /* destination f64 */
+    if (vt_isfloat(st)) {
+        if (!rdn(k, &in->ops[1], st, a, sizeof a)) return 0;
+        snprintf(r, sizeof r, "__d_bits((float)(%s))", a);
+    } else {
+        if (!rd(k, &in->ops[1], st, a, sizeof a)) return 0;
+        if (vt_issigned(st)) snprintf(r, sizeof r, "__i2d((long)(%s))", a);
+        else snprintf(r, sizeof r, "__u2d((ulong)(%s))", a);
+    }
+    return wr(k, &in->ops[0], r, VT_F64);
+}
+
 static int emit_cvt(K *k, instr_t *in) {
     int x2d = 0;
     int dt = type_part(in, 0, &x2d), st = type_part(in, 1, NULL);
     if (dt < 0 || st < 0) { PERR(k->p, "PTX line %d: malformed cvt", in->line); return 0; }
+    if (g_f64x && (dt == VT_F64 || st == VT_F64)) return emit_cvt_f64(k, in, dt, st);
     char a[EXL], r[EXL];
     if (x2d) { /* cvt.rn.f16x2.f32 d, a, b  → d = {cvt(a) hi, cvt(b) lo} */
         char b[EXL];
@@ -1434,28 +1512,52 @@ static int emit_atomic(K *k, instr_t *in, int has_result) {
     else snprintf(ptr, sizeof ptr, "(%s)", a);
     sb_puts(k->o, "{\n");
     if (sz == 8) {
+        /* Metal has no 64-bit compare-and-swap, so every 64-bit atomic is a
+         * read-modify-write under a spinlock from a hashed lock table. */
+        char nv[EXL];
+        int sg = vt_issigned(bt);
+        const char *T = sg ? "long" : "ulong";
         if (!strcmp(op, "add")) {
-            if (!k->p->warned_atom64) { k->p->warned_atom64 = 1; warn(k->p, "64-bit atomic add emulated with two 32-bit atomics (sum is exact; returned old value may be torn)"); }
-            sb_printf(k->o, "%s atomic_uint* __lo = (%s atomic_uint*)%s; ulong __v = (ulong)(%s);\n", as, as, ptr, b);
-            sb_printf(k->o,
-                      "uint __ol = atomic_fetch_add_explicit(__lo, (uint)__v, memory_order_relaxed);\n"
-                      "uint __cy = (uint)(((ulong)__ol + (ulong)(uint)__v) >> 32);\n"
-                      "uint __oh = atomic_fetch_add_explicit(__lo + 1, (uint)(__v >> 32) + __cy, memory_order_relaxed);\n"
-                      "__old%d = (%s)(((ulong)__oh << 32) | (ulong)__ol);\n",
-                      id, ct);
-        } else if ((!strcmp(op, "min") || !strcmp(op, "max")) && sp == SP_GLOBAL && !vt_issigned(bt) && !vt_isfloat(bt)) {
-            sb_printf(k->o, "atomic_%s_explicit((device atomic_ulong*)%s, (ulong)(%s), memory_order_relaxed); __old%d = 0;\n",
-                      !strcmp(op, "min") ? "min" : "max", ptr, b, id);
-            if (has_result) { PERR(k->p, "PTX line %d: 64-bit atomic min/max with a result is not supported on Metal", in->line); return 0; }
-        } else if (variants == 2 && sp == SP_SHARED) {
-            /* shared-memory flavour of a generic atomic Metal cannot do: only reachable if
-             * the program really aims it at shared memory */
-            warn(k->p, "PTX line %d: 64-bit atomic '%s' through a generic pointer is only supported on device memory", in->line, op);
-            sb_printf(k->o, "__old%d = 0;\n", id);
-        } else {
-            PERR(k->p, "PTX line %d: 64-bit atomic '%s' is not supported by Metal on this GPU", in->line, op);
-            return 0;
-        }
+            if (bt == VT_F64 && g_f64x) snprintf(nv, sizeof nv, "__dadd(__o, (ulong)(%s))", b);
+            else if (bt == VT_F64) snprintf(nv, sizeof nv, "__d_bits(__d_from_bits(__o) + (%s))", b);
+            else snprintf(nv, sizeof nv, "(ulong)((%s)__o + (%s)(%s))", T, T, b);
+        } else if (!strcmp(op, "exch")) snprintf(nv, sizeof nv, "(ulong)(%s)", b);
+        else if (!strcmp(op, "cas")) snprintf(nv, sizeof nv, "(__o == (ulong)(%s)) ? (ulong)(%s) : __o", b, c);
+        else if (!strcmp(op, "min") || !strcmp(op, "max")) {
+            if (bt == VT_F64) { PERR(k->p, "PTX line %d: f64 atomic min/max is not supported", in->line); return 0; }
+            snprintf(nv, sizeof nv, "(ulong)%s((%s)__o, (%s)(%s))", op, T, T, b);
+        } else if (!strcmp(op, "and") || !strcmp(op, "or") || !strcmp(op, "xor"))
+            snprintf(nv, sizeof nv, "__o %c (ulong)(%s)", op[0] == 'a' ? '&' : op[0] == 'o' ? '|' : '^', b);
+        else { PERR(k->p, "PTX line %d: 64-bit atomic '%s' is not supported", in->line, op); return 0; }
+        if (bt == VT_F64 && !g_f64x && !strcmp(op, "exch")) snprintf(nv, sizeof nv, "__d_bits(%s)", b);
+        if (sp == SP_SHARED)
+            sb_printf(k->o, "uint __lki = ((uint)(%s) >> 3u) ^ (__ctaid.x * 0x9E3779B1u) ^ (__ctaid.y * 0x85EBCA77u) ^ (__ctaid.z * 0xC2B2AE3Du);\n", a);
+        else
+            sb_printf(k->o, "uint __lki = (uint)((%s) >> 3) ^ (uint)((%s) >> 19);\n", a, a);
+        /* One lane of the SIMD-group at a time takes a lock (elected with a ballot),
+         * so a lane never spins on a lock held by another lane of its own
+         * SIMD-group: deadlock-free whatever the compiler does with the loop. */
+        sb_printf(k->o,
+                  "device atomic_uint* __lk = (device atomic_uint*)__locks + (__lki & %uu);\n"
+                  "volatile %s ulong* __pv = (volatile %s ulong*)%s;\n"
+                  "ulong __res = 0ul;\n"
+                  "for (bool __done = false;;) {\n"
+                  "  ulong __pend = (ulong)(simd_vote::vote_t)simd_ballot(!__done);\n"
+                  "  if (__pend == 0ul) break;\n"
+                  "  if (__lane == (uint)ctz(__pend)) {\n"
+                  "    while (atomic_exchange_explicit(__lk, 1u, memory_order_relaxed) != 0u) {}\n"
+                  "    atomic_thread_fence(mem_flags::mem_device | mem_flags::mem_threadgroup, memory_order_seq_cst, thread_scope_device);\n"
+                  "    ulong __o = *__pv;\n"
+                  "    *__pv = %s;\n"
+                  "    __res = __o;\n"
+                  "    atomic_thread_fence(mem_flags::mem_device | mem_flags::mem_threadgroup, memory_order_seq_cst, thread_scope_device);\n"
+                  "    atomic_store_explicit(__lk, 0u, memory_order_relaxed);\n"
+                  "    __done = true;\n"
+                  "  }\n"
+                  "}\n",
+                  MC_LOCK_COUNT - 1, as, as, ptr, nv);
+        if (bt == VT_F64 && !g_f64x) sb_printf(k->o, "__old%d = __d_from_bits(__res);\n", id);
+        else sb_printf(k->o, "__old%d = (%s)__res;\n", id, ct);
     } else if (vt == VT_F32) {
         if (!strcmp(op, "add") && sp == SP_GLOBAL) {
             sb_printf(k->o, "__old%d = atomic_fetch_add_explicit((device atomic_float*)%s, %s, memory_order_relaxed);\n", id, ptr, b);
@@ -1545,6 +1647,50 @@ static int emit_f16x2(K *k, instr_t *in, const char *base, int x2) {
     return wr(k, &in->ops[0], r, VT_U32);
 }
 
+static int is_f64_arith(const char *op) {
+    static const char *ops[] = {"add", "sub", "mul", "mad", "fma", "div", "min", "max", "abs", "neg", "rcp", "sqrt", "rsqrt", "copysign", "testp", NULL};
+    for (int i = 0; ops[i]; i++) if (!strcmp(op, ops[i])) return 1;
+    return 0;
+}
+
+/* f64 arithmetic in exact mode: calls into the binary64 soft-float library. */
+static int emit_f64(K *k, instr_t *in) {
+    const char *op = in->parts[0];
+    char a[EXL], b[EXL] = "", c[EXL] = "", r[EXL];
+    int need = !strcmp(op, "mad") || !strcmp(op, "fma") ? 4 : (!strcmp(op, "abs") || !strcmp(op, "neg") || !strcmp(op, "rcp") || !strcmp(op, "sqrt") ||
+                                                              !strcmp(op, "rsqrt") || !strcmp(op, "testp")) ? 2 : 3;
+    if (in->nops < need) { PERR(k->p, "PTX line %d: '%s' needs %d operands", in->line, in->opcode, need); return 0; }
+    if (!rd(k, &in->ops[1], VT_F64, a, sizeof a)) return 0;
+    if (need >= 3 && !rd(k, &in->ops[2], VT_F64, b, sizeof b)) return 0;
+    if (need >= 4 && !rd(k, &in->ops[3], VT_F64, c, sizeof c)) return 0;
+    if (!strcmp(op, "add")) snprintf(r, sizeof r, "__dadd(%s, %s)", a, b);
+    else if (!strcmp(op, "sub")) snprintf(r, sizeof r, "__dsub(%s, %s)", a, b);
+    else if (!strcmp(op, "mul")) snprintf(r, sizeof r, "__dmul(%s, %s)", a, b);
+    else if (!strcmp(op, "mad") || !strcmp(op, "fma")) snprintf(r, sizeof r, "__dfma(%s, %s, %s)", a, b, c);
+    else if (!strcmp(op, "div")) snprintf(r, sizeof r, "__ddiv(%s, %s)", a, b);
+    else if (!strcmp(op, "min")) snprintf(r, sizeof r, "__dmin(%s, %s)", a, b);
+    else if (!strcmp(op, "max")) snprintf(r, sizeof r, "__dmax(%s, %s)", a, b);
+    else if (!strcmp(op, "abs")) snprintf(r, sizeof r, "((%s) & 0x7FFFFFFFFFFFFFFFul)", a);
+    else if (!strcmp(op, "neg")) snprintf(r, sizeof r, "((%s) ^ 0x8000000000000000ul)", a);
+    else if (!strcmp(op, "rcp")) snprintf(r, sizeof r, "__ddiv(0x3FF0000000000000ul, %s)", a);
+    else if (!strcmp(op, "sqrt")) snprintf(r, sizeof r, "__dsqrt(%s)", a);
+    else if (!strcmp(op, "rsqrt")) snprintf(r, sizeof r, "__ddiv(0x3FF0000000000000ul, __dsqrt(%s))", a);
+    else if (!strcmp(op, "copysign")) snprintf(r, sizeof r, "(((%s) & 0x7FFFFFFFFFFFFFFFul) | ((%s) & 0x8000000000000000ul))", b, a);
+    else { /* testp */
+        const char *q = in->parts[1];
+        char m[EXL];
+        snprintf(m, sizeof m, "((%s) & 0x7FFFFFFFFFFFFFFFul)", a);
+        if (!strcmp(q, "finite")) snprintf(r, sizeof r, "(%s < 0x7FF0000000000000ul)", m);
+        else if (!strcmp(q, "infinite")) snprintf(r, sizeof r, "(%s == 0x7FF0000000000000ul)", m);
+        else if (!strcmp(q, "number")) snprintf(r, sizeof r, "(%s <= 0x7FF0000000000000ul)", m);
+        else if (!strcmp(q, "notanumber")) snprintf(r, sizeof r, "(%s > 0x7FF0000000000000ul)", m);
+        else if (!strcmp(q, "normal")) snprintf(r, sizeof r, "(%s >= 0x0010000000000000ul && %s < 0x7FF0000000000000ul)", m, m);
+        else snprintf(r, sizeof r, "(%s != 0ul && %s < 0x0010000000000000ul)", m, m);
+        return wr(k, &in->ops[0], r, VT_PRED);
+    }
+    return wr(k, &in->ops[0], r, VT_F64);
+}
+
 /* Emit one non-terminator instruction. */
 static int emit_instr(K *k, instr_t *in) {
     const char *op = in->parts[0];
@@ -1566,7 +1712,9 @@ static int emit_instr(K *k, instr_t *in) {
 #define RN(i, t, buf) do { if (!rdn(k, &in->ops[i], (t), buf, sizeof buf)) return 0; } while (0)
 #define NEED(nn) do { if (in->nops < (nn)) { PERR(k->p, "PTX line %d: '%s' needs %d operands", in->line, in->opcode, nn); return 0; } } while (0)
 
-    if (!strcmp(op, "mov")) {
+    if (g_f64x && vt == VT_F64 && is_f64_arith(op)) {
+        ok = emit_f64(k, in);
+    } else if (!strcmp(op, "mov")) {
         NEED(2);
         if (in->ops[0].kind == OP_VEC) { /* unpack */
             int n = in->ops[0].nelems, es = VT_SIZE[vt] / n;
@@ -2125,17 +2273,19 @@ static const char *PRELUDE =
     "#pragma clang diagnostic ignored \"-Wparentheses-equality\"\n"
     "#pragma clang diagnostic ignored \"-Wshift-count-overflow\"\n"
     "// --- IEEE binary64 <-> fp32 (Metal has no double) ---\n"
-    "static inline float __d_from_bits(ulong b) {\n"
-    "  uint hi = (uint)(b >> 32), lo = (uint)b; uint sign = hi & 0x80000000u;\n"
-    "  int e = (int)((hi >> 20) & 0x7FFu); uint mhi = hi & 0xFFFFFu;\n"
-    "  if (e == 0x7FF) return as_type<float>(sign | 0x7F800000u | (((mhi | lo) != 0u) ? 0x400000u : 0u));\n"
+    "static inline float __d_from_bits(ulong b) { /* binary64 -> fp32, round to nearest even */\n"
+    "  uint sign = (uint)(b >> 32) & 0x80000000u; int e = (int)((b >> 52) & 0x7FFul); ulong f = b & 0xFFFFFFFFFFFFFul;\n"
+    "  if (e == 0x7FF) return as_type<float>(sign | 0x7F800000u | (f != 0ul ? 0x400000u : 0u));\n"
     "  if (e == 0) return as_type<float>(sign);\n"
-    "  int fe = e - 1023 + 127; ulong m = ((ulong)mhi << 32) | (ulong)lo;\n"
-    "  uint m23 = (uint)(m >> 29); ulong rem = m & ((1ul << 29) - 1ul); ulong half_ = 1ul << 28;\n"
-    "  if (rem > half_ || (rem == half_ && (m23 & 1u))) { m23++; if (m23 == 0x800000u) { m23 = 0u; fe++; } }\n"
-    "  if (fe >= 255) return as_type<float>(sign | 0x7F800000u);\n"
-    "  if (fe <= 0) { if (fe < -23) return as_type<float>(sign); uint full = m23 | 0x800000u; return as_type<float>(sign | (full >> (uint)(1 - fe))); }\n"
-    "  return as_type<float>(sign | ((uint)fe << 23) | m23);\n"
+    "  ulong m = f | 0x10000000000000ul; int ue = e - 1023;\n"
+    "  if (ue > 127) return as_type<float>(sign | 0x7F800000u);\n"
+    "  uint sh = ue >= -126 ? 29u : (uint)(29 + (-126 - ue));\n"
+    "  if (sh > 63u) return as_type<float>(sign);\n"
+    "  ulong r = m >> sh, rem = m & ((1ul << sh) - 1ul), half_ = 1ul << (sh - 1u);\n"
+    "  if (rem > half_ || (rem == half_ && (r & 1ul) != 0ul)) r++;\n"
+    "  if (ue >= -126) { if (r == 0x1000000ul) { r >>= 1; ue++; if (ue > 127) return as_type<float>(sign | 0x7F800000u); }\n"
+    "    return as_type<float>(sign | ((uint)(ue + 127) << 23) | ((uint)r & 0x7FFFFFu)); }\n"
+    "  return as_type<float>(sign | (uint)r);\n"
     "}\n"
     "static inline ulong __d_bits(float f) {\n"
     "  uint u = as_type<uint>(f); ulong sign = (ulong)(u & 0x80000000u) << 32; uint e = (u >> 23) & 0xFFu; uint m = u & 0x7FFFFFu;\n"
@@ -2752,7 +2902,7 @@ static int emit_kernel(P *p, func_t *f, mc_kernel_t *ki, sb_t *out) {
     f->params = NULL;
     ki->param_bytes = f->param_bytes;
     ki->hidden_offset = (uint32_t)align_up(f->param_bytes, 8);
-    ki->total_param_bytes = ki->hidden_offset + 16;
+    ki->total_param_bytes = ki->hidden_offset + MC_HIDDEN_BYTES;
     ki->uses_smem = k.uses_smem || has_extern;
     ki->smem_dyn_offset = k.smem_dyn_off;
     ki->static_smem = k.smem_static;
@@ -2775,6 +2925,7 @@ static int emit_kernel(P *p, func_t *f, mc_kernel_t *ki, sb_t *out) {
             "    uint __warpid [[simdgroup_index_in_threadgroup]])\n{\n");
     sb_printf(out, "  ulong __gbase = *(constant ulong*)(__params + %uu);\n", ki->hidden_offset);
     sb_printf(out, "  uint __dynsmem = *(constant uint*)(__params + %uu);\n", ki->hidden_offset + 8);
+    sb_printf(out, "  ulong __locks = *(constant ulong*)(__params + %uu);\n", ki->hidden_offset + 16);
     sb_puts(out, "  uint __cc = 0u;\n");
     if (k.local_bytes) {
         sb_printf(out, "  uint4 __ldepot_store[%u];\n  thread uchar* __ldepot = (thread uchar*)__ldepot_store;\n", (k.local_bytes + 15) / 16);
@@ -2867,8 +3018,22 @@ int mc_translate_ptx(const char *ptx, size_t len, mc_module_t *out) {
         free(p.warn.p);
         return -1;
     }
+    const char *f64env = getenv("METALCUDA_F64");
+    g_f64x = !(f64env && !strcmp(f64env, "fast"));
     sb_t msl = {0};
     sb_puts(&msl, PRELUDE);
+    if (g_f64x && strstr(ptx, ".f64")) {
+        sb_puts(&msl, "// --- IEEE binary64 soft-float (METALCUDA_F64=exact) ---\n");
+        sb_puts(&msl, MC_SOFTFLOAT64_MSL);
+        sb_puts(&msl, "static inline bool __dsetp(ulong a, ulong b, uint op) {\n"
+                      "  int c = __dcmp(a, b);\n"
+                      "  switch (op) {\n"
+                      "  case 0u: return c == 0; case 1u: return c == -1 || c == 1; case 2u: return c == -1; case 3u: return c == -1 || c == 0;\n"
+                      "  case 4u: return c == 1; case 5u: return c == 0 || c == 1; case 6u: return c == 0 || c == 2; case 7u: return c != 0;\n"
+                      "  case 8u: return c == -1 || c == 2; case 9u: return c != 1; case 10u: return c == 1 || c == 2; case 11u: return c != -1;\n"
+                      "  case 12u: return c != 2; default: return c == 2; }\n"
+                      "}\n");
+    }
     int nent = 0;
     for (int i = 0; i < p.nfuncs; i++) if (p.funcs[i].is_entry && !p.funcs[i].is_proto) nent++;
     out->kernels = (mc_kernel_t *)calloc((size_t)(nent ? nent : 1), sizeof(mc_kernel_t));
