@@ -2,12 +2,12 @@
 
 *Translating NVIDIA PTX to Metal at load time, and what it takes to make an Apple GPU answer to `cuLaunchKernel`.*
 
-> **Draft. Scope note before the fun part.** "Pre-compiled CUDA binaries" here means macOS programs that
-> already contain their GPU code as PTX and talk to the CUDA Driver/Runtime API: C/C++ executables, CUDA
-> C++ applications, and Python scripts that `dlopen("libcuda.so.1")`. None of their source and none of
-> their GPU code is changed or recompiled. The kernels are JIT-translated when the program loads them.
-> What this does **not** do is run a Linux ELF or a Linux PyPI wheel (`torch`, `cupy`…) on a Mac: macOS
-> can't load those files, no matter which GPU library sits underneath. I'll come back to PyTorch at the end.
+> **Draft. Scope note before the fun part.** The programs in this article are macOS programs that use the
+> CUDA Driver/Runtime API and carry their GPU code as PTX: C/C++ executables, CUDA C++ applications, and
+> Python scripts that `dlopen("libcuda.so.1")`. Their source and their GPU code stay untouched; the PTX is
+> JIT-translated to Metal when the program loads it. What this does **not** do is run a Linux ELF or a
+> Linux PyPI wheel (`torch`, `cupy`…) on a Mac: macOS can't load those files, no matter which GPU library
+> sits underneath. I'll come back to PyTorch at the end.
 
 ---
 

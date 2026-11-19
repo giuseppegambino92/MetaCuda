@@ -200,8 +200,15 @@ included) was 10–50× slower per dispatch for a while, so measure on your own 
   value may be torn), min/max only on device memory, no 64-bit CAS/exch. Threadgroup memory is 32 KiB
   (CUDA kernels requesting more fail with `CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES`). Named barriers become full
   barriers.
-* **Scheduling:** all streams share one in-order queue (legal, but no cross-stream concurrency). Async
-  memcpys complete synchronously. `cuMemFree` synchronises.
+* **Scheduling:** all streams share one in-order Metal queue. This is a legal CUDA schedule, but kernels on
+  different streams never overlap: two independent kernels on two streams take about as long as running
+  them back to back. Async memcpys complete synchronously. `cuMemFree` synchronises.
+* **No isolation between kernels in a process.** Device pointers are raw GPU addresses and every allocation
+  is resident, so a kernel can read or write any allocation in its process, not just the ones passed as
+  arguments. Out-of-range accesses are not reported: in a quick probe, writes to unmapped addresses returned
+  `CUDA_SUCCESS` with no fault. CUDA doesn't isolate allocations within a context either; isolation from
+  other processes relies on macOS giving each process its own GPU address space (not tested here). Don't run untrusted kernels in a
+  process that holds data they shouldn't see.
 * **Interposition** needs a non-SIP process: `/usr/bin/python3` and other system binaries ignore
   `DYLD_INSERT_LIBRARIES`. Use Homebrew/pyenv/venv Python.
 
