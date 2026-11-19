@@ -1,5 +1,6 @@
 // IEEE 754 binary64 arithmetic in software for Metal (which has no double type).
-// Values travel as their bit patterns (ulong). Round-to-nearest-even, subnormals,
+// Values travel as their bit patterns (ulong). All four IEEE rounding modes
+// (rm: 0 nearest-even, 1 toward zero, 2 toward -inf, 3 toward +inf), subnormals,
 // signed zeros, infinities and NaNs (results are the default quiet NaN).
 // Algorithms follow Berkeley SoftFloat 3 (J. Hauser); division and square root
 // use exact bit-serial integer algorithms.
@@ -19,25 +20,28 @@ static inline ulong __dnorm_sub(ulong sig, thread int* e) {
   return sig << (uint)sh;
 }
 // sig: leading 1 at bit 62, 10 rounding bits; e: biased exponent - 1
-static inline ulong __dround_pack(uint s, int e, ulong sig) {
+static inline ulong __dround_pack(uint s, int e, ulong sig, uint rm) {
+  ulong inc = rm == 0u ? 0x200ul : ((rm == 2u && s != 0u) || (rm == 3u && s == 0u)) ? 0x3FFul : 0ul;
   uint rb = (uint)(sig & 0x3FFul);
   if ((uint)e >= 0x7FDu) {
     if (e < 0) { sig = __dsrjam(sig, (uint)(-e)); e = 0; rb = (uint)(sig & 0x3FFul); }
-    else if (e > 0x7FD || sig + 0x200ul >= 0x8000000000000000ul) return ((ulong)s << 63) | D_INF;
+    else if (e > 0x7FD || sig + inc >= 0x8000000000000000ul) /* overflow: infinity, or the largest finite value */
+      return (((ulong)s << 63) | D_INF) - (inc == 0ul ? 1ul : 0ul);
   }
-  sig = (sig + 0x200ul) >> 10;
-  if (rb == 0x200u) sig &= ~1ul;
+  sig = (sig + inc) >> 10;
+  if (rm == 0u && rb == 0x200u) sig &= ~1ul;
   if (sig == 0ul) e = 0;
   return __dpack(s, e, sig);
 }
-static inline ulong __dnorm_round_pack(uint s, int e, ulong sig) {
+static inline ulong __dnorm_round_pack(uint s, int e, ulong sig, uint rm) {
   int sh = (int)clz(sig) - 1;
   e -= sh;
   if (sh >= 10 && (uint)e < 0x7FDu) return __dpack(s, sig != 0ul ? e : 0, sig << (uint)(sh - 10));
-  return __dround_pack(s, e, sig << (uint)sh);
+  return __dround_pack(s, e, sig << (uint)sh, rm);
 }
+static inline ulong __dzero(uint rm) { return rm == 2u ? D_SIGN : 0ul; } /* exact x - x */
 
-static inline ulong __dadd_mags(ulong a, ulong b, uint s) {
+static inline ulong __dadd_mags(ulong a, ulong b, uint s, uint rm) {
   int ea = (int)((a >> 52) & 0x7FFul), eb = (int)((b >> 52) & 0x7FFul);
   ulong sa = a & D_FRAC, sb = b & D_FRAC;
   int d = ea - eb, ez;
@@ -63,16 +67,16 @@ static inline ulong __dadd_mags(ulong a, ulong b, uint s) {
     sz = 0x2000000000000000ul + sa + sb;
     if (sz < 0x4000000000000000ul) { ez--; sz <<= 1; }
   }
-  return __dround_pack(s, ez, sz);
+  return __dround_pack(s, ez, sz, rm);
 }
-static inline ulong __dsub_mags(ulong a, ulong b, uint s) {
+static inline ulong __dsub_mags(ulong a, ulong b, uint s, uint rm) {
   int ea = (int)((a >> 52) & 0x7FFul), eb = (int)((b >> 52) & 0x7FFul);
   ulong sa = a & D_FRAC, sb = b & D_FRAC;
   int d = ea - eb;
   if (d == 0) {
     if (ea == 0x7FF) return D_QNAN;
     long sd = (long)sa - (long)sb;
-    if (sd == 0l) return 0ul;
+    if (sd == 0l) return __dzero(rm);
     if (ea != 0) ea--;
     if (sd < 0l) { s ^= 1u; sd = -sd; }
     int sh = (int)clz((ulong)sd) - 11;
@@ -99,15 +103,15 @@ static inline ulong __dsub_mags(ulong a, ulong b, uint s) {
     ez = ea;
     sz = sa - sb;
   }
-  return __dnorm_round_pack(s, ez - 1, sz);
+  return __dnorm_round_pack(s, ez - 1, sz, rm);
 }
-static inline ulong __dadd(ulong a, ulong b) {
+static inline ulong __dadd(ulong a, ulong b, uint rm) {
   uint sa = (uint)(a >> 63), sb = (uint)(b >> 63);
-  return sa == sb ? __dadd_mags(a, b, sa) : __dsub_mags(a, b, sa);
+  return sa == sb ? __dadd_mags(a, b, sa, rm) : __dsub_mags(a, b, sa, rm);
 }
-static inline ulong __dsub(ulong a, ulong b) { return __dadd(a, b ^ D_SIGN); }
+static inline ulong __dsub(ulong a, ulong b, uint rm) { return __dadd(a, b ^ D_SIGN, rm); }
 
-static inline ulong __dmul(ulong a, ulong b) {
+static inline ulong __dmul(ulong a, ulong b, uint rm) {
   uint s = (uint)((a ^ b) >> 63);
   int ea = (int)((a >> 52) & 0x7FFul), eb = (int)((b >> 52) & 0x7FFul);
   ulong sa = a & D_FRAC, sb = b & D_FRAC;
@@ -129,10 +133,10 @@ static inline ulong __dmul(ulong a, ulong b) {
   ulong hi = mulhi(sa, sb), lo = sa * sb;
   ulong sz = hi | (ulong)(lo != 0ul);
   if (sz < 0x4000000000000000ul) { ez--; sz <<= 1; }
-  return __dround_pack(s, ez, sz);
+  return __dround_pack(s, ez, sz, rm);
 }
 
-static inline ulong __ddiv(ulong a, ulong b) {
+static inline ulong __ddiv(ulong a, ulong b, uint rm) {
   uint s = (uint)((a ^ b) >> 63);
   int ea = (int)((a >> 52) & 0x7FFul), eb = (int)((b >> 52) & 0x7FFul);
   ulong sa = a & D_FRAC, sb = b & D_FRAC;
@@ -156,10 +160,10 @@ static inline ulong __ddiv(ulong a, ulong b) {
     if (rem >= sb) { rem -= sb; q |= 1ul; }
     rem <<= 1;
   }
-  return __dround_pack(s, ez, q | (ulong)(rem != 0ul));
+  return __dround_pack(s, ez, q | (ulong)(rem != 0ul), rm);
 }
 
-static inline ulong __dsqrt(ulong a) {
+static inline ulong __dsqrt(ulong a, uint rm) {
   uint s = (uint)(a >> 63);
   int ea = (int)((a >> 52) & 0x7FFul);
   ulong sa = a & D_FRAC;
@@ -178,7 +182,7 @@ static inline ulong __dsqrt(ulong a) {
     root <<= 1;
     if (rem >= trial) { rem -= trial; root |= 1ul; }
   }
-  return __dround_pack(0u, (e >> 1) + 0x3FE, (root << 6) | (ulong)(rem != 0ul));
+  return __dround_pack(0u, (e >> 1) + 0x3FE, (root << 6) | (ulong)(rem != 0ul), rm);
 }
 
 struct __u128 { ulong hi, lo; };
@@ -210,7 +214,7 @@ static inline bool __u128_lt(__u128 a, __u128 b) { return a.hi < b.hi || (a.hi =
 static inline int __u128_top(__u128 x) { return x.hi != 0ul ? 127 - (int)clz(x.hi) : 63 - (int)clz(x.lo); }
 
 // fused multiply-add with a single rounding: exact 106-bit product, 128-bit alignment
-static inline ulong __dfma(ulong a, ulong b, ulong c) {
+static inline ulong __dfma(ulong a, ulong b, ulong c, uint rm) {
   uint sp = (uint)((a ^ b) >> 63), sc = (uint)(c >> 63);
   int ea = (int)((a >> 52) & 0x7FFul), eb = (int)((b >> 52) & 0x7FFul), ec = (int)((c >> 52) & 0x7FFul);
   ulong fa = a & D_FRAC, fb = b & D_FRAC, fc = c & D_FRAC;
@@ -222,8 +226,8 @@ static inline ulong __dfma(ulong a, ulong b, ulong c) {
     return ((ulong)sp << 63) | D_INF;
   }
   if (ec == 0x7FF) return c;
-  if (za || zb) return __dadd((ulong)sp << 63, c);
-  if (ec == 0 && fc == 0ul) return __dmul(a, b);
+  if (za || zb) return __dadd((ulong)sp << 63, c, rm);
+  if (ec == 0 && fc == 0ul) return __dmul(a, b, rm);
   if (ea == 0) fa = __dnorm_sub(fa, &ea);
   if (eb == 0) fb = __dnorm_sub(fb, &eb);
   if (ec == 0) fc = __dnorm_sub(fc, &ec);
@@ -240,10 +244,10 @@ static inline ulong __dfma(ulong a, ulong b, ulong c) {
   if (ep > ecu || (ep == ecu && !__u128_lt(P, C))) { X = P; sx = sp; ex = ep; Y = __u128_shr_jam(C, (uint)min(ep - ecu, 200)); sy = sc; }
   else { X = C; sx = sc; ex = ecu; Y = __u128_shr_jam(P, (uint)min(ecu - ep, 200)); sy = sp; }
   __u128 S = sx == sy ? __u128_add(X, Y) : __u128_sub(X, Y);
-  if (S.hi == 0ul && S.lo == 0ul) return 0ul;
+  if (S.hi == 0ul && S.lo == 0ul) return __dzero(rm);
   int ls = __u128_top(S);
   ulong sig = ls >= 62 ? __u128_shr_jam(S, (uint)(ls - 62)).lo : (S.lo << (uint)(62 - ls));
-  return __dround_pack(sx, ex + ls - 125 + 0x3FE, sig);
+  return __dround_pack(sx, ex + ls - 125 + 0x3FE, sig, rm);
 }
 
 // --- comparisons, sign operations, classification ---
@@ -268,16 +272,40 @@ static inline ulong __dmax(ulong a, ulong b) {
 }
 
 // --- conversions ---
-static inline ulong __i2d(long v) {
+static inline ulong __i2d(long v, uint rm) {
   uint s = v < 0l ? 1u : 0u;
   ulong m = s != 0u ? (ulong)0 - (ulong)v : (ulong)v;
   if ((m & 0x7FFFFFFFFFFFFFFFul) == 0ul) return s != 0u ? __dpack(1u, 0x43E, 0ul) : 0ul;
-  return __dnorm_round_pack(s, 0x43C, m);
+  return __dnorm_round_pack(s, 0x43C, m, rm);
 }
-static inline ulong __u2d(ulong m) {
+static inline ulong __u2d(ulong m, uint rm) {
   if (m == 0ul) return 0ul;
-  if ((m & D_SIGN) != 0ul) return __dround_pack(0u, 0x43D, (m >> 1) | (m & 1ul));
-  return __dnorm_round_pack(0u, 0x43C, m);
+  if ((m & D_SIGN) != 0ul) return __dround_pack(0u, 0x43D, (m >> 1) | (m & 1ul), rm);
+  return __dnorm_round_pack(0u, 0x43C, m, rm);
+}
+// binary64 -> binary32 with an explicit rounding mode
+static inline float __d2f_r(ulong b, uint rm) {
+  uint sign = (uint)(b >> 32) & 0x80000000u;
+  int e = (int)((b >> 52) & 0x7FFul);
+  ulong f = b & D_FRAC;
+  if (e == 0x7FF) return as_type<float>(sign | 0x7F800000u | (f != 0ul ? 0x400000u : 0u));
+  if (e == 0 && f == 0ul) return as_type<float>(sign);
+  bool away = (rm == 2u && sign != 0u) || (rm == 3u && sign == 0u);   /* directed rounding away from zero */
+  uint maxf = sign | 0x7F7FFFFFu, inf = sign | 0x7F800000u;
+  if (e == 0) return as_type<float>(sign | (away ? 1u : 0u));        /* double subnormal: below float range */
+  ulong m = f | 0x0010000000000000ul;
+  int ue = e - 1023;
+  if (ue > 127) return as_type<float>((rm == 0u || away) ? inf : maxf);
+  uint sh = ue >= -126 ? 29u : (uint)(29 + (-126 - ue));
+  if (sh > 63u) return as_type<float>(sign | (away ? 1u : 0u));
+  ulong r = m >> sh, rem = m & ((1ul << sh) - 1ul), hv = 1ul << (sh - 1u);
+  bool up = rm == 0u ? (rem > hv || (rem == hv && (r & 1ul) != 0ul)) : (away && rem != 0ul);
+  if (up) r++;
+  if (ue >= -126) {
+    if (r == 0x1000000ul) { r >>= 1; ue++; if (ue > 127) return as_type<float>((rm == 0u || away) ? inf : maxf); }
+    return as_type<float>(sign | ((uint)(ue + 127) << 23) | ((uint)r & 0x7FFFFFu));
+  }
+  return as_type<float>(sign | (uint)r);
 }
 // round to an integral double; mode 0 nearest-even, 1 toward zero, 2 down, 3 up
 static inline ulong __dround(ulong x, uint mode) {

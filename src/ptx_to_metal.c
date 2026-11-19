@@ -1376,7 +1376,7 @@ static int emit_cvt_f64(K *k, instr_t *in, int dt, int st) {
             if (has_part(in, "sat")) { snprintf(t, sizeof t, "__dmin(__dmax(%s, 0ul), 0x3FF0000000000000ul)", r); snprintf(r, sizeof r, "%s", t); }
             return wr(k, &in->ops[0], r, VT_F64);
         }
-        if (dt == VT_F32) { snprintf(r, sizeof r, "__d_from_bits(%s)", a); return wr(k, &in->ops[0], r, VT_F32); }
+        if (dt == VT_F32) { snprintf(r, sizeof r, "__d2f_r(%s, %du)", a, round_mode(in, 0)); return wr(k, &in->ops[0], r, VT_F32); }
         if (dt == VT_F16) { snprintf(r, sizeof r, "((half)__d_from_bits(%s))", a); return wr(k, &in->ops[0], r, VT_F16); }
         if (dt == VT_BF16) { snprintf(r, sizeof r, "__f2bf(__d_from_bits(%s))", a); return wr(k, &in->ops[0], r, VT_U16); }
         snprintf(t, sizeof t, "__dround(%s, %du)", a, round_mode(in, 1));
@@ -1398,8 +1398,8 @@ static int emit_cvt_f64(K *k, instr_t *in, int dt, int st) {
         snprintf(r, sizeof r, "__d_bits((float)(%s))", a);
     } else {
         if (!rd(k, &in->ops[1], st, a, sizeof a)) return 0;
-        if (vt_issigned(st)) snprintf(r, sizeof r, "__i2d((long)(%s))", a);
-        else snprintf(r, sizeof r, "__u2d((ulong)(%s))", a);
+        if (vt_issigned(st)) snprintf(r, sizeof r, "__i2d((long)(%s), %du)", a, round_mode(in, 0));
+        else snprintf(r, sizeof r, "__u2d((ulong)(%s), %du)", a, round_mode(in, 0));
     }
     return wr(k, &in->ops[0], r, VT_F64);
 }
@@ -1514,29 +1514,38 @@ static int emit_atomic(K *k, instr_t *in, int has_result) {
     if (sz == 8) {
         /* Metal has no 64-bit compare-and-swap, so every 64-bit atomic is a
          * read-modify-write under a spinlock from a hashed lock table. */
+        /* new value as a function of the current value __o and the operands of
+         * lane j (__bj, __cj), all carried as 64-bit patterns */
         char nv[EXL];
         int sg = vt_issigned(bt);
         const char *T = sg ? "long" : "ulong";
         if (!strcmp(op, "add")) {
-            if (bt == VT_F64 && g_f64x) snprintf(nv, sizeof nv, "__dadd(__o, (ulong)(%s))", b);
-            else if (bt == VT_F64) snprintf(nv, sizeof nv, "__d_bits(__d_from_bits(__o) + (%s))", b);
-            else snprintf(nv, sizeof nv, "(ulong)((%s)__o + (%s)(%s))", T, T, b);
-        } else if (!strcmp(op, "exch")) snprintf(nv, sizeof nv, "(ulong)(%s)", b);
-        else if (!strcmp(op, "cas")) snprintf(nv, sizeof nv, "(__o == (ulong)(%s)) ? (ulong)(%s) : __o", b, c);
+            if (bt == VT_F64 && g_f64x) snprintf(nv, sizeof nv, "__dadd(__o, __bj, 0u)");
+            else if (bt == VT_F64) snprintf(nv, sizeof nv, "__d_bits(__d_from_bits(__o) + __d_from_bits(__bj))");
+            else snprintf(nv, sizeof nv, "(ulong)((%s)__o + (%s)__bj)", T, T);
+        } else if (!strcmp(op, "exch")) snprintf(nv, sizeof nv, "__bj");
+        else if (!strcmp(op, "cas")) snprintf(nv, sizeof nv, "(__o == __bj) ? __cj : __o");
         else if (!strcmp(op, "min") || !strcmp(op, "max")) {
             if (bt == VT_F64) { PERR(k->p, "PTX line %d: f64 atomic min/max is not supported", in->line); return 0; }
-            snprintf(nv, sizeof nv, "(ulong)%s((%s)__o, (%s)(%s))", op, T, T, b);
+            snprintf(nv, sizeof nv, "(ulong)%s((%s)__o, (%s)__bj)", op, T, T);
         } else if (!strcmp(op, "and") || !strcmp(op, "or") || !strcmp(op, "xor"))
-            snprintf(nv, sizeof nv, "__o %c (ulong)(%s)", op[0] == 'a' ? '&' : op[0] == 'o' ? '|' : '^', b);
+            snprintf(nv, sizeof nv, "(__o %c __bj)", op[0] == 'a' ? '&' : op[0] == 'o' ? '|' : '^');
         else { PERR(k->p, "PTX line %d: 64-bit atomic '%s' is not supported", in->line, op); return 0; }
-        if (bt == VT_F64 && !g_f64x && !strcmp(op, "exch")) snprintf(nv, sizeof nv, "__d_bits(%s)", b);
+        const char *tobits = (bt == VT_F64 && !g_f64x) ? "__d_bits" : "(ulong)";
+        sb_printf(k->o, "ulong __bv = %s(%s), __cv = %s(%s), __av = (ulong)(%s);\n", tobits, b, tobits, c[0] ? c : "0", a);
         if (sp == SP_SHARED)
-            sb_printf(k->o, "uint __lki = ((uint)(%s) >> 3u) ^ (__ctaid.x * 0x9E3779B1u) ^ (__ctaid.y * 0x85EBCA77u) ^ (__ctaid.z * 0xC2B2AE3Du);\n", a);
+            sb_printf(k->o, "uint __lki = ((uint)__av >> 3u) ^ (__ctaid.x * 0x9E3779B1u) ^ (__ctaid.y * 0x85EBCA77u) ^ (__ctaid.z * 0xC2B2AE3Du);\n");
         else
-            sb_printf(k->o, "uint __lki = (uint)((%s) >> 3) ^ (uint)((%s) >> 19);\n", a, a);
-        /* One lane of the SIMD-group at a time takes a lock (elected with a ballot),
-         * so a lane never spins on a lock held by another lane of its own
-         * SIMD-group: deadlock-free whatever the compiler does with the loop. */
+            sb_printf(k->o, "uint __lki = (uint)(__av >> 3) ^ (uint)(__av >> 19);\n");
+        /* One elected lane per SIMD-group tries the lock; the outcome is broadcast and
+         * on failure the whole SIMD-group retries in uniform control flow. The winner
+         * applies, in lane order, the operations of every lane of its group that
+         * targets the same address: one lock round trip per SIMD-group instead of
+         * one per lane.
+         * CAVEAT (measured): Metal gives no forward-progress guarantee for spinning
+         * across threadgroups. With thousands of SIMD-groups contending for ONE
+         * lock, a dispatch occasionally never completes — reproduced with a plain
+         * Metal spinlock too (~1 in 120 dispatches at 6,400 SIMD-groups). */
         sb_printf(k->o,
                   "device atomic_uint* __lk = (device atomic_uint*)__locks + (__lki & %uu);\n"
                   "volatile %s ulong* __pv = (volatile %s ulong*)%s;\n"
@@ -1544,16 +1553,34 @@ static int emit_atomic(K *k, instr_t *in, int has_result) {
                   "for (bool __done = false;;) {\n"
                   "  ulong __pend = (ulong)(simd_vote::vote_t)simd_ballot(!__done);\n"
                   "  if (__pend == 0ul) break;\n"
-                  "  if (__lane == (uint)ctz(__pend)) {\n"
-                  "    while (atomic_exchange_explicit(__lk, 1u, memory_order_relaxed) != 0u) {}\n"
-                  "    atomic_thread_fence(mem_flags::mem_device | mem_flags::mem_threadgroup, memory_order_seq_cst, thread_scope_device);\n"
-                  "    ulong __o = *__pv;\n"
-                  "    *__pv = %s;\n"
-                  "    __res = __o;\n"
+                  "  ushort __ld = (ushort)ctz(__pend);\n"
+                  "  bool __mine = !__done && __av == as_type<ulong>(simd_shuffle(as_type<uint2>(__av), __ld));\n"
+                  "  ulong __grp = (ulong)(simd_vote::vote_t)simd_ballot(__mine);\n"
+                  "  ulong __cur = 0ul;\n"
+                  "  uint __got = 0u;\n"
+                  "  if (__lane == (uint)__ld) {\n"
+                  "    __got = atomic_exchange_explicit(__lk, 1u, memory_order_relaxed) == 0u ? 1u : 0u;\n"
+                  "    if (__got != 0u) {\n"
+                  "      atomic_thread_fence(mem_flags::mem_device | mem_flags::mem_threadgroup, memory_order_seq_cst, thread_scope_device);\n"
+                  "      __cur = *__pv;\n"
+                  "    }\n"
+                  "  }\n"
+                  "  if (simd_shuffle(__got, __ld) == 0u) continue; /* lock busy: the whole SIMD-group retries */\n"
+                  "  __cur = as_type<ulong>(simd_shuffle(as_type<uint2>(__cur), __ld));\n"
+                  "  for (ulong __m = __grp; __m != 0ul; __m &= __m - 1ul) {\n"
+                  "    ushort __j = (ushort)ctz(__m);\n"
+                  "    ulong __bj = as_type<ulong>(simd_shuffle(as_type<uint2>(__bv), __j));\n"
+                  "    ulong __cj = as_type<ulong>(simd_shuffle(as_type<uint2>(__cv), __j));\n"
+                  "    ulong __o = __cur;\n"
+                  "    if (__lane == (uint)__j) __res = __o;\n"
+                  "    __cur = %s;\n"
+                  "  }\n"
+                  "  if (__lane == (uint)__ld) {\n"
+                  "    *__pv = __cur;\n"
                   "    atomic_thread_fence(mem_flags::mem_device | mem_flags::mem_threadgroup, memory_order_seq_cst, thread_scope_device);\n"
                   "    atomic_store_explicit(__lk, 0u, memory_order_relaxed);\n"
-                  "    __done = true;\n"
                   "  }\n"
+                  "  if (__mine) __done = true;\n"
                   "}\n",
                   MC_LOCK_COUNT - 1, as, as, ptr, nv);
         if (bt == VT_F64 && !g_f64x) sb_printf(k->o, "__old%d = __d_from_bits(__res);\n", id);
@@ -1663,18 +1690,19 @@ static int emit_f64(K *k, instr_t *in) {
     if (!rd(k, &in->ops[1], VT_F64, a, sizeof a)) return 0;
     if (need >= 3 && !rd(k, &in->ops[2], VT_F64, b, sizeof b)) return 0;
     if (need >= 4 && !rd(k, &in->ops[3], VT_F64, c, sizeof c)) return 0;
-    if (!strcmp(op, "add")) snprintf(r, sizeof r, "__dadd(%s, %s)", a, b);
-    else if (!strcmp(op, "sub")) snprintf(r, sizeof r, "__dsub(%s, %s)", a, b);
-    else if (!strcmp(op, "mul")) snprintf(r, sizeof r, "__dmul(%s, %s)", a, b);
-    else if (!strcmp(op, "mad") || !strcmp(op, "fma")) snprintf(r, sizeof r, "__dfma(%s, %s, %s)", a, b, c);
-    else if (!strcmp(op, "div")) snprintf(r, sizeof r, "__ddiv(%s, %s)", a, b);
+    int rm = round_mode(in, 0);
+    if (!strcmp(op, "add")) snprintf(r, sizeof r, "__dadd(%s, %s, %du)", a, b, rm);
+    else if (!strcmp(op, "sub")) snprintf(r, sizeof r, "__dsub(%s, %s, %du)", a, b, rm);
+    else if (!strcmp(op, "mul")) snprintf(r, sizeof r, "__dmul(%s, %s, %du)", a, b, rm);
+    else if (!strcmp(op, "mad") || !strcmp(op, "fma")) snprintf(r, sizeof r, "__dfma(%s, %s, %s, %du)", a, b, c, rm);
+    else if (!strcmp(op, "div")) snprintf(r, sizeof r, "__ddiv(%s, %s, %du)", a, b, rm);
     else if (!strcmp(op, "min")) snprintf(r, sizeof r, "__dmin(%s, %s)", a, b);
     else if (!strcmp(op, "max")) snprintf(r, sizeof r, "__dmax(%s, %s)", a, b);
     else if (!strcmp(op, "abs")) snprintf(r, sizeof r, "((%s) & 0x7FFFFFFFFFFFFFFFul)", a);
     else if (!strcmp(op, "neg")) snprintf(r, sizeof r, "((%s) ^ 0x8000000000000000ul)", a);
-    else if (!strcmp(op, "rcp")) snprintf(r, sizeof r, "__ddiv(0x3FF0000000000000ul, %s)", a);
-    else if (!strcmp(op, "sqrt")) snprintf(r, sizeof r, "__dsqrt(%s)", a);
-    else if (!strcmp(op, "rsqrt")) snprintf(r, sizeof r, "__ddiv(0x3FF0000000000000ul, __dsqrt(%s))", a);
+    else if (!strcmp(op, "rcp")) snprintf(r, sizeof r, "__ddiv(0x3FF0000000000000ul, %s, %du)", a, rm);
+    else if (!strcmp(op, "sqrt")) snprintf(r, sizeof r, "__dsqrt(%s, %du)", a, rm);
+    else if (!strcmp(op, "rsqrt")) snprintf(r, sizeof r, "__ddiv(0x3FF0000000000000ul, __dsqrt(%s, 0u), 0u)", a);
     else if (!strcmp(op, "copysign")) snprintf(r, sizeof r, "(((%s) & 0x7FFFFFFFFFFFFFFFul) | ((%s) & 0x8000000000000000ul))", b, a);
     else { /* testp */
         const char *q = in->parts[1];

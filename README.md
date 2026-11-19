@@ -126,15 +126,25 @@ Key design decisions:
   * **IEEE binary64 in software.** Metal has no `double`. f64 values stay binary64 bit patterns in `ulong`
     registers and every operation goes through a soft-float library in MSL (`src/softfloat64.metal`:
     SoftFloat-style add/sub/mul/fma with an exact 106-bit product, bit-serial division and square root,
-    round-to-nearest-even, subnormals, signed zeros, NaN/inf). It is checked bit for bit against the CPU on
-    17 operations × 262,144 inputs, including NaN, infinities, subnormals and catastrophic cancellation. The
-    cost is real: about 4.6× slower than fp32 on a memory-bound kernel, and more on compute-bound ones.
+    all four IEEE rounding modes (PTX `.rn/.rz/.rm/.rp` on arithmetic and conversions), subnormals, signed
+    zeros, NaN/inf). Two independent checks:
+    * `tests/test_softfloat.c`, a differential test against the CPU's hardware FPU under `fesetround`, which
+      shares no code with the soft-float. It uses hand-written PTX for 12 operations × 4 rounding modes,
+      with an exhaustive grid of special values plus TestFloat-style operands (boundary exponents,
+      structured significands, near-halfway values, forced cancellation). 50,331,648 results, all
+      bit-exact. Injected bugs (wrong directed-rounding increment, a dropped sticky bit) are caught.
+    * The CUDA-compiled `f64_exact` kernel in the driver suite.
+
+    The cost is real: about 4.6× slower than fp32 on a memory-bound kernel, and more on compute-bound ones.
     `METALCUDA_F64=fast` computes f64 in fp32 instead (layout stays binary64).
   * **64-bit atomics** (Metal has no 64-bit CAS): every 64-bit atomic, `double` `atomicAdd` included, is a
     read-modify-write under a spinlock from a hashed lock table. One lane per SIMD-group is elected with a
-    ballot to take a lock, so no lane ever spins on a lock held by its own SIMD-group. That keeps it
-    deadlock-free, which the first, simpler retry loop was not.
-* **Caching.** Module key = SHA-256(translator version, fp policy, PTX). The MSL is kept for inspection and
+    ballot to try the lock, and on failure the whole SIMD-group retries in uniform control flow. The winner
+    applies the operations of every lane of its SIMD-group that targets the same address, in lane order:
+    one lock round trip per SIMD-group instead of one per thread. That makes contended CAS loops 5–21×
+    faster. See Limitations for what it cannot guarantee.
+* **Caching.** Module key = SHA-256 of the exact Metal source compiled (fp policy + generated MSL), so any
+  translator change invalidates stale entries. The MSL is kept for inspection and
   the compiled pipelines go into a Metal binary archive: module load ~400 ms cold → ~2–3 ms warm.
 
 ### Supported surface
@@ -170,6 +180,7 @@ Key design decisions:
 | `tests/test_cuda_basic.c` | Phase-4 Driver API walk-through with nvcc-format PTX (vectorAdd, 1 M elements) |
 | `tests/test_driver_suite.c` | 31 tests × 3 builds of the same kernels (clang `-O3`, `-O1`, `-O0`): integer/bit/float semantics, conversions, structs by value, f64, 3-D grids, shared-memory reduction, warp shuffles/votes, histogram (shared + global atomics), scan, tiled SGEMM, atomics (CAS loops, inc wrap, 64-bit), local memory, `bar.red`, globals/constants, managed/pinned/registered memory, VMM, events, error paths, `cuGetProcAddress`, 10 k dependent launches, divergent-loop + barrier, an irreducible CFG, async-copy ordering and host-buffer reuse, reported capabilities; 64-bit atomics (returned old values must be an exact permutation, exchange must conserve every value, CAS loops, min/max, shared memory, `double` `atomicAdd`); IEEE binary64 bit-exactness |
 | `tests/test_runtime_app.cu` | an ordinary CUDA C++ app, built with both launch ABIs: bit-exact Mandelbrot, template kernels on a stream, softmax with dynamic shared memory, `cudaMemcpyToSymbol`/`FromSymbol`, managed memory, error idioms |
+| `tests/test_softfloat.c` | differential test of the binary64 soft-float against the CPU's FPU, using hand-written PTX for add/sub/mul/div/fma/sqrt/rcp and f64↔f32 / int→f64 / round-to-integral / f64→s64 conversions in all four rounding modes: 50 M results, bit-exact |
 | `tests/test_python.py` | a Linux-style `ctypes.CDLL("libcuda.so.1")` script fails on plain macOS and passes under `python -m metalcuda`; `metalcuda.enable()`; NumPy-checked vecadd, SAXPY, SGEMM, reduction, histogram, integer ops |
 
 Every GPU result is compared against a CPU reference (exact for integer/bitwise work and wherever the
@@ -207,11 +218,19 @@ included) was 10–50× slower per dispatch for a while, so measure on your own 
 * **Not translated:** tensor-core instructions (`mma`, `wmma`, `ldmatrix`), textures/surfaces, calls to
   non-inlined device functions (`call` other than `vprintf`, which is dropped), indirect branches,
   split barriers, cluster/TMA features, dynamic parallelism, grid-wide cooperative sync.
-* **f64 is exact but slow** (soft-float, see above). Rounding-mode modifiers other than round-to-nearest on
-  f64 arithmetic (`add.rz.f64`, …) are treated as round-to-nearest.
-* **64-bit atomics are correct but serialized per address.** Each attempt costs ~0.2 µs, so a 64-bit CAS retry
-  loop with many threads on one address degrades quadratically (one address, 4,096 threads: 1.7 s;
-  16,384 threads: 31 s). They are not atomic with respect to 32-bit atomics on the halves of the same word.
+* **f64 is exact but slow** (soft-float, see above).
+* **64-bit atomics are correct but serialized per address, and can hang under extreme contention.**
+  * **Cost:** a 64-bit CAS retry loop with many threads on one address is still quadratic. On one address,
+    4,096 threads take 0.34 s, 16,384 take 1.45 s and 50,000 take 15 s.
+  * **Hangs:** Metal gives no forward-progress guarantee for spinning across threadgroups. With thousands of
+    SIMD-groups contending for one lock, a dispatch occasionally never completes. This reproduces with a
+    plain Metal spinlock and no MetaCuda code (about 1 in 120 dispatches at 6,400 SIMD-groups), and a hung
+    dispatch leaves the GPU slow for a while afterwards. Backoff avoided the hang in a short run but made
+    dispatches take seconds. In my runs no hang occurred at up to about 500 SIMD-groups per address, which
+    is what the tests use (that is not a proof). A lock-free design (multi-word CAS with helping) would be
+    needed to remove the risk.
+  * **Mixed widths:** 64-bit atomics are not atomic with respect to 32-bit atomics on the halves of the same
+    word.
 * **Hardware:** threadgroup memory is 32 KiB (CUDA kernels requesting more fail with
   `CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES`). Named barriers become full barriers.
 * **Scheduling:** all streams share one in-order Metal queue. This is a legal CUDA schedule, but kernels on

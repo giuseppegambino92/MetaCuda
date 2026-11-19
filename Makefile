@@ -103,6 +103,10 @@ $(BUILD)/ptx-O1/%.ptx: tests/kernels/%.cu include/metalcuda_device.h
 $(BIN)/test_cuda_basic: tests/test_cuda_basic.c lib | $(BIN)
 	$(CC) -O2 -Iinclude $< -L$(LIB) -lcuda -Wl,-rpath,@loader_path/../lib -o $@
 
+# Differential test of the binary64 soft-float against the CPU's FPU (all rounding modes)
+$(BIN)/test_softfloat: tests/test_softfloat.c lib | $(BIN)
+	$(CC) -O1 -ffp-model=strict -Iinclude $< -L$(LIB) -lcuda -Wl,-rpath,@loader_path/../lib -o $@
+
 # Driver API suite over clang-generated PTX
 $(BIN)/test_driver_suite: tests/test_driver_suite.c lib | $(BIN)
 	$(CC) -O2 -ffp-contract=off -Iinclude $< -L$(LIB) -lcuda -Wl,-rpath,@loader_path/../lib -o $@
@@ -122,7 +126,7 @@ $(BUILD)/app/%_legacy.o: tests/%.cu $(BUILD)/app/%.fatbin
 $(BIN)/%: $(BUILD)/app/%.o lib | $(BIN)
 	$(CUDACXX) $< -L$(LIB) -lcudart -Wl,-rpath,@loader_path/../lib -o $@
 
-tests: $(PTX) $(PTX_O0) $(PTX_O1) $(BIN)/test_cuda_basic $(BIN)/test_driver_suite $(BIN)/test_runtime_app $(BIN)/test_runtime_app_legacy
+tests: $(PTX) $(PTX_O0) $(PTX_O1) $(BIN)/test_cuda_basic $(BIN)/test_driver_suite $(BIN)/test_softfloat $(BIN)/test_runtime_app $(BIN)/test_runtime_app_legacy
 
 # A non-SIP interpreter is required for the DYLD_INSERT_LIBRARIES test (/usr/bin/python3 strips DYLD_*).
 BASE_PYTHON ?= $(firstword $(wildcard /opt/homebrew/bin/python3 /opt/homebrew/bin/python3.1[0-9] /usr/local/bin/python3))
@@ -137,6 +141,7 @@ test-c: tests
 	$(BIN)/test_driver_suite $(PTXDIR)
 	$(BIN)/test_driver_suite $(BUILD)/ptx-O0
 	$(BIN)/test_driver_suite $(BUILD)/ptx-O1
+	$(BIN)/test_softfloat
 
 test-app: tests
 	$(BIN)/test_runtime_app

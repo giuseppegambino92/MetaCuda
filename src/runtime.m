@@ -405,11 +405,6 @@ static int file_exists(const char *p) {
  * are explicit), so by default Metal is not allowed to fuse mul+add on its own:
  * results then match the PTX bit for bit. METALCUDA_FP_CONTRACT=fast lets the
  * Metal compiler contract (what ptxas may do for non-.rn ops). */
-static const char *f64_mode(void) {
-    const char *e = getenv("METALCUDA_F64");
-    return e && !strcmp(e, "fast") ? "fast" : "exact";
-}
-
 static const char *fp_contract_pragma(void) {
     const char *e = getenv("METALCUDA_FP_CONTRACT");
     if (e && !strcmp(e, "fast")) return "#pragma METAL fp contract(fast)\n";
@@ -427,20 +422,20 @@ static CUresult build_module(const char *ptx, size_t len, struct CUmod_st **out)
     double t0 = CACurrentMediaTime();
     struct CUmod_st *m = (struct CUmod_st *)calloc(1, sizeof *m);
     const char *pragma = fp_contract_pragma();
-    {
-        char policy[128];
-        snprintf(policy, sizeof policy, "%sf64=%s\n", pragma, f64_mode());
-        size_t pl = strlen(policy);
-        char *keyed = (char *)malloc(len + pl);
-        memcpy(keyed, policy, pl);
-        memcpy(keyed + pl, ptx, len);
-        sha256_hex(keyed, len + pl, m->hash);
-        free(keyed);
-    }
     if (mc_translate_ptx(ptx, len, &m->ir)) {
         LOGW("PTX translation failed: %s", m->ir.error);
         free(m);
         return CUDA_ERROR_INVALID_PTX;
+    }
+    /* cache key = the exact Metal source that gets compiled (fp policy pragma + MSL),
+     * so any translator or soft-float change invalidates stale entries */
+    {
+        size_t pl = strlen(pragma);
+        char *keyed = (char *)malloc(m->ir.msl_len + pl);
+        memcpy(keyed, pragma, pl);
+        memcpy(keyed + pl, m->ir.msl, m->ir.msl_len);
+        sha256_hex(keyed, m->ir.msl_len + pl, m->hash);
+        free(keyed);
     }
     double t1 = CACurrentMediaTime();
     if (m->ir.warnings && mc_log_level() >= 1) fprintf(stderr, "[metalcuda] translator warnings:\n%s", m->ir.warnings);

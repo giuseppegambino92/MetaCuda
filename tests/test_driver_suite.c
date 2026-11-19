@@ -643,7 +643,9 @@ static int cmp_u64(const void *a, const void *b) {
 
 static int t_atom64_unique(void) {
     CUfunction f = fn(M_prec, "atom64_add_unique");
-    int n = 200000;
+    /* 16k threads = 512 SIMD-groups on one address. Far higher contention can hang:
+     * Metal has no forward-progress guarantee for cross-threadgroup spinning (README). */
+    int n = 16384;
     unsigned long long incs[2] = {1ull, 0x100000001ull};
     unsigned long long *olds = malloc((size_t)n * 8);
     CUdeviceptr dc, dol;

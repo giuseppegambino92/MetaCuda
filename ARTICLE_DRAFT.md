@@ -153,6 +153,16 @@ cancellation and compares every result bit for bit with the CPU: zero difference
 4.6× fp32 on a memory-bound kernel, more on compute-bound ones), so `METALCUDA_F64=fast` keeps the fp32 path
 as an explicit opt-in.
 
+Testing the soft-float against the same CPU code paths I wrote it from would prove little, so the second
+check is fully independent. A program generates PTX by hand (no compiler in the loop), one kernel per
+operation and rounding modifier: `add`, `sub`, `mul`, `div`, `fma`, `sqrt`, `rcp` in `.rn/.rz/.rm/.rp`, plus
+the f64↔f32, integer→f64, round-to-integral and f64→integer conversions. It compares every result with the
+Apple CPU's hardware FPU running under `fesetround`. Inputs are an exhaustive grid of special values plus
+TestFloat-style operands: boundary exponents, all-ones and single-bit significands, near-halfway cases, and
+fma addends one ulp away from `-(a*b)`. That is 50,331,648 results with zero differences. To make sure the
+test can actually fail, I injected two bugs (a wrong directed-rounding increment, a dropped sticky bit);
+it caught both.
+
 ### MSL has no `goto`
 
 PTX control flow is labels and predicated branches. MSL has no `goto` and doesn't even allow labeled
@@ -226,7 +236,17 @@ The long tail is what makes real compiler output run:
   lock. The fix elects one lane per SIMD-group with a ballot, so a SIMD-group never contains both a holder
   and a spinner. The tests check that the old values returned by 200,000 concurrent `atomicAdd`s form an
   exact permutation and that `atomicExch` conserves every value. The price is serialization: a 64-bit CAS
-  retry loop with thousands of threads on one address is quadratic, at ~0.2 µs per attempt.
+  retry loop with thousands of threads on one address is quadratic. Combining helped a lot: the lock winner
+  applies the operations of every lane in its SIMD-group that targets the same address, so there is one
+  lock round trip per SIMD-group instead of one per thread. 16,384 contending threads went from 31 s to
+  1.45 s.
+* The uncomfortable finding: **spinlocks across threadgroups are not reliable on this GPU.** At extreme
+  contention (200,000 threads on one counter) about one dispatch in ten never finished. It looked like my
+  bug until a 25-line pure-Metal spinlock did the same: about 1 in 120 dispatches hung at 6,400 contending
+  SIMD-groups. Metal makes no forward-progress promise for this pattern. Exponential backoff avoided the
+  hang in a short run but made dispatches take seconds. So the README now says it plainly: 64-bit atomics
+  are exact, but under extreme contention they can hang. The real fix is a lock-free multi-word CAS, which
+  is future work.
 * `__syncthreads_count` is `bar.red.popc`, which needs a scratch word and three barriers.
 * PTX's `mul24` is defined for any input, while MSL's is undefined outside ±2²³. That one was caught by a
   random-input test, not by reading the spec.
